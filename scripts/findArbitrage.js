@@ -204,21 +204,27 @@ function groupSportsbookGames(sportsbookGames) {
  */
 function main() {
   try {
+    // Get sport from command line argument (default to 'nba')
+    const sport = process.argv[2] || 'nba';
+    const sportUpper = sport.toUpperCase();
+    
+    console.log(`\nAnalyzing ${sportUpper} arbitrage opportunities...`);
+    
     // File paths (go up one level from scripts/ to root)
-    const polyPath = path.join(__dirname, '..', 'outputs', 'polymarket', 'polymarket_nba.csv');
+    const polyPath = path.join(__dirname, '..', 'outputs', 'polymarket', `polymarket_${sport}.csv`);
     
     // Find the most recent sportsbook CSV file
-    const nbaDir = path.join(__dirname, '..', 'outputs', 'nba');
-    const files = fs.readdirSync(nbaDir)
-      .filter(f => f.startsWith('nba_games_') && f.endsWith('.csv'))
+    const sportDir = path.join(__dirname, '..', 'outputs', sport);
+    const files = fs.readdirSync(sportDir)
+      .filter(f => f.startsWith(`${sport}_games_`) && f.endsWith('.csv'))
       .sort()
       .reverse();
     
     if (files.length === 0) {
-      throw new Error('No sportsbook CSV files found in outputs/nba/');
+      throw new Error(`No sportsbook CSV files found in outputs/${sport}/`);
     }
     
-    const sportsbookPath = path.join(nbaDir, files[0]);
+    const sportsbookPath = path.join(sportDir, files[0]);
     console.log(`Using sportsbook file: ${files[0]}`);
     
     console.log('Reading Polymarket data...');
@@ -338,7 +344,7 @@ function main() {
     
     // Save output
     const timestamp = new Date().toISOString().split('T')[0];
-    const filename = `arb_${timestamp}.csv`;
+    const filename = `arb_${sport}_${timestamp}.csv`;
     const filepath = path.join(OUTPUTS_DIR, filename);
     
     fs.writeFileSync(filepath, csvRows.join('\n'), 'utf8');
