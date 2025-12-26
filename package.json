@@ -1,0 +1,20 @@
+{
+  "name": "polyarb",
+  "version": "1.0.0",
+  "description": "Sports odds arbitrage finder",
+  "main": "getSports.js",
+  "scripts": {
+    "getSports": "node getSports.js",
+    "getNBAGames": "node getNBAGames.js",
+    "getPolymarketNBA": "node getPolymarketNBA.js",
+    "findArbitrage": "node findArbitrage.js",
+    "findAllArbitrage": "node findAllArbitrage.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^16.3.1"
+  }
+}
+
