@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Button Test - Debug Script</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            padding: 20px;
+            background: #1a1a1a;
+            color: #fff;
+        }
+        .test-section {
+            margin: 20px 0;
+            padding: 15px;
+            background: #2a2a2a;
+            border-radius: 8px;
+        }
+        .test-button {
+            padding: 12px 24px;
+            background: #ec4899;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 16px;
+            margin: 10px 5px;
+        }
+        .test-button:hover {
+            background: #db2777;
+        }
+        .log {
+            background: #000;
+            padding: 10px;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 12px;
+            max-height: 300px;
+            overflow-y: auto;
+            margin-top: 10px;
+        }
+        .log-item {
+            margin: 5px 0;
+            padding: 5px;
+        }
+        .log-success { color: #22c55e; }
+        .log-error { color: #ef4444; }
+        .log-info { color: #3b82f6; }
+    </style>
+</head>
+<body>
+    <h1>Button Functionality Test</h1>
+    
+    <div class="test-section">
+        <h2>Test 1: Basic Click Handler</h2>
+        <button class="test-button" id="test1">Test Click Event</button>
+        <div class="log" id="log1"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>Test 2: Router Navigation (Simulated)</h2>
+        <button class="test-button" id="test2">Test Navigation to /results</button>
+        <div class="log" id="log2"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>Test 3: API Call Test</h2>
+        <button class="test-button" id="test3">Test /api/run-arbitrage</button>
+        <div class="log" id="log3"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>Test 4: Full Flow (Click → API → Navigate)</h2>
+        <button class="test-button" id="test4">Test Full Flow</button>
+        <div class="log" id="log4"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>Diagnostics</h2>
+        <button class="test-button" id="diagnostics">Run Diagnostics</button>
+        <div class="log" id="log-diagnostics"></div>
+    </div>
+
+    <script>
+        const logs = {
+            log1: document.getElementById('log1'),
+            log2: document.getElementById('log2'),
+            log3: document.getElementById('log3'),
+            log4: document.getElementById('log4'),
+            diagnostics: document.getElementById('log-diagnostics')
+        };
+
+        function addLog(logId, message, type = 'info') {
+            const log = logs[logId];
+            const item = document.createElement('div');
+            item.className = `log-item log-${type}`;
+            item.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            log.appendChild(item);
+            log.scrollTop = log.scrollHeight;
+        }
+
+        function clearLog(logId) {
+            logs[logId].innerHTML = '';
+        }
+
+        // Test 1: Basic Click Handler
+        document.getElementById('test1').addEventListener('click', () => {
+            clearLog('log1');
+            addLog('log1', 'Button clicked!', 'success');
+            addLog('log1', 'Click event is working correctly', 'info');
+        });
+
+        // Test 2: Router Navigation (Simulated)
+        document.getElementById('test2').addEventListener('click', () => {
+            clearLog('log2');
+            addLog('log2', 'Simulating navigation to /results', 'info');
+            addLog('log2', 'In Next.js, this would call: router.push("/results")', 'info');
+            addLog('log2', 'Current URL would change to: http://localhost:3000/results', 'info');
+        });
+
+        // Test 3: API Call Test
+        document.getElementById('test3').addEventListener('click', async () => {
+            clearLog('log3');
+            addLog('log3', 'Testing API call to /api/run-arbitrage', 'info');
+            try {
+                const response = await fetch('/api/run-arbitrage', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                });
+                const data = await response.json();
+                if (response.ok) {
+                    addLog('log3', `API Success: ${data.message}`, 'success');
+                } else {
+                    addLog('log3', `API Error: ${data.error}`, 'error');
+                }
+            } catch (error) {
+                addLog('log3', `Network Error: ${error.message}`, 'error');
+                addLog('log3', 'Make sure the Next.js dev server is running on port 3000', 'info');
+            }
+        });
+
+        // Test 4: Full Flow
+        document.getElementById('test4').addEventListener('click', async () => {
+            clearLog('log4');
+            addLog('log4', '=== Starting Full Flow Test ===', 'info');
+            addLog('log4', 'Step 1: Button clicked', 'success');
+            
+            addLog('log4', 'Step 2: Calling API...', 'info');
+            try {
+                const response = await fetch('/api/run-arbitrage', {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                if (response.ok) {
+                    addLog('log4', `Step 2: API Success - ${data.message}`, 'success');
+                    addLog('log4', 'Step 3: Would navigate to /results', 'info');
+                    addLog('log4', '=== Full Flow Complete ===', 'success');
+                } else {
+                    addLog('log4', `Step 2: API Error - ${data.error}`, 'error');
+                }
+            } catch (error) {
+                addLog('log4', `Step 2: Network Error - ${error.message}`, 'error');
+            }
+        });
+
+        // Diagnostics
+        document.getElementById('diagnostics').addEventListener('click', () => {
+            clearLog('diagnostics');
+            addLog('diagnostics', '=== Running Diagnostics ===', 'info');
+            addLog('diagnostics', `User Agent: ${navigator.userAgent}`, 'info');
+            addLog('diagnostics', `Current URL: ${window.location.href}`, 'info');
+            addLog('diagnostics', `Window Location: ${window.location.origin}${window.location.pathname}`, 'info');
+            addLog('diagnostics', `Fetch Available: ${typeof fetch !== 'undefined' ? 'Yes' : 'No'}`, 
+                typeof fetch !== 'undefined' ? 'success' : 'error');
+            addLog('diagnostics', `Click Events Supported: Yes`, 'success');
+            
+            // Test if we can reach the API
+            fetch('/api/run-arbitrage', { method: 'POST' })
+                .then(res => {
+                    addLog('diagnostics', `API Endpoint Reachable: Yes (Status: ${res.status})`, 'success');
+                    return res.json();
+                })
+                .then(data => {
+                    addLog('diagnostics', `API Response: ${JSON.stringify(data)}`, 'info');
+                })
+                .catch(err => {
+                    addLog('diagnostics', `API Endpoint Reachable: No - ${err.message}`, 'error');
+                    addLog('diagnostics', 'Make sure Next.js dev server is running: npm run dev', 'info');
+                });
+        });
+    </script>
+</body>
+</html>
+

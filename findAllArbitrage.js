@@ -23,7 +23,14 @@ function runSportPipeline(sport, sportDir) {
   console.log(`\nStep 1/3: Fetching current ${sportUpper} lines from sportsbooks...`);
   console.log('─'.repeat(60));
   try {
-    const scriptName = sport === 'nba' ? 'getNBAGames.js' : 'nfl/getNFLGames.js';
+    let scriptName;
+    if (sport === 'nba') {
+      scriptName = 'getNBAGames.js';
+    } else if (sport === 'nfl') {
+      scriptName = 'nfl/getNFLGames.js';
+    } else if (sport === 'nhl') {
+      scriptName = 'nhl/getNHLGames.js';
+    }
     execSync(`node ${scriptName}`, { 
       stdio: 'inherit',
       cwd: scriptsDir 
@@ -31,6 +38,7 @@ function runSportPipeline(sport, sportDir) {
     console.log(`✓ ${sportUpper} sportsbook data fetched successfully`);
   } catch (error) {
     console.error(`✗ Error fetching ${sportUpper} sportsbook data`);
+    console.error(`  Error details: ${error.message}`);
     return false;
   }
 
@@ -38,7 +46,14 @@ function runSportPipeline(sport, sportDir) {
   console.log(`\nStep 2/3: Fetching current ${sportUpper} lines from Polymarket...`);
   console.log('─'.repeat(60));
   try {
-    const scriptName = sport === 'nba' ? 'getPolymarketNBA.js' : 'nfl/getPolymarketNFL.js';
+    let scriptName;
+    if (sport === 'nba') {
+      scriptName = 'getPolymarketNBA.js';
+    } else if (sport === 'nfl') {
+      scriptName = 'nfl/getPolymarketNFL.js';
+    } else if (sport === 'nhl') {
+      scriptName = 'nhl/getPolymarketNHL.js';
+    }
     execSync(`node ${scriptName}`, { 
       stdio: 'inherit',
       cwd: scriptsDir 
@@ -46,6 +61,7 @@ function runSportPipeline(sport, sportDir) {
     console.log(`✓ ${sportUpper} Polymarket data fetched successfully`);
   } catch (error) {
     console.error(`✗ Error fetching ${sportUpper} Polymarket data`);
+    console.error(`  Error details: ${error.message}`);
     return false;
   }
 
@@ -60,6 +76,7 @@ function runSportPipeline(sport, sportDir) {
     console.log(`✓ ${sportUpper} arbitrage analysis complete`);
   } catch (error) {
     console.error(`✗ Error analyzing ${sportUpper} arbitrage opportunities`);
+    console.error(`  Error details: ${error.message}`);
     return false;
   }
   
@@ -72,12 +89,22 @@ const nbaSuccess = runSportPipeline('nba', scriptsDir);
 // Run NFL pipeline
 const nflSuccess = runSportPipeline('nfl', nflDir);
 
+// Run NHL pipeline
+const nhlSuccess = runSportPipeline('nhl', path.join(__dirname, 'scripts', 'nhl'));
+
 console.log('\n' + '='.repeat(60));
-if (nbaSuccess && nflSuccess) {
+console.log('PIPELINE SUMMARY');
+console.log('='.repeat(60));
+console.log(`NBA: ${nbaSuccess ? '✓ Success' : '✗ Failed'}`);
+console.log(`NFL: ${nflSuccess ? '✓ Success' : '✗ Failed'}`);
+console.log(`NHL: ${nhlSuccess ? '✓ Success' : '✗ Failed'}`);
+console.log('='.repeat(60));
+if (nbaSuccess && nflSuccess && nhlSuccess) {
   console.log('Pipeline complete! Check outputs/final_arb/ for results.');
-  console.log('Files: arb_nba_YYYY-MM-DD.csv and arb_nfl_YYYY-MM-DD.csv');
+  console.log('Files: arb_nba_YYYY-MM-DD.csv, arb_nfl_YYYY-MM-DD.csv, and arb_nhl_YYYY-MM-DD.csv');
 } else {
-  console.log('Pipeline completed with some errors. Check output above.');
+  console.log('Pipeline completed with some errors. Check output above for details.');
+  console.log('Only successfully completed sports will have output files.');
 }
 console.log('='.repeat(60));
 

@@ -183,13 +183,15 @@ function parseCSV(filepath) {
 }
 
 /**
- * Group sportsbook games by game ID
+ * Group sportsbook games by game identifier
+ * Uses Game ID if available, otherwise creates composite key from date/time/teams
  */
 function groupSportsbookGames(sportsbookGames) {
   const grouped = {};
   
   for (const game of sportsbookGames) {
-    const gameId = game['Game ID'];
+    // Try to use Game ID first, otherwise create composite key
+    const gameId = game['Game ID'] || `${game.Date}_${game.Time}_${game['Away Team']}_${game['Home Team']}`;
     if (!grouped[gameId]) {
       grouped[gameId] = [];
     }
@@ -250,31 +252,40 @@ function main() {
       // Find matching Polymarket game
       const polyGame = findMatchingPolyGame(firstSBGame, polyGames);
       
-      if (!polyGame) {
-        console.log(`No Polymarket match found for: ${firstSBGame['Away Team']} @ ${firstSBGame['Home Team']}`);
-        continue;
-      }
-      
       // Find sportsbook lines (lowest and highest)
       const sbLines = findSportsbookLines(sbGamesForGame);
       
-      // Get Polymarket prices
-      const polyAwayPct = parseFloat(polyGame['Away Implied Prob (%)']);
-      const polyHomePct = parseFloat(polyGame['Home Implied Prob (%)']);
+      let hasArb = 'NO';
+      let polyAwayPct = 0;
+      let polyHomePct = 0;
+      let profitPercent = 0;
+      let bestOption = 1.0;
       
-      if (isNaN(polyAwayPct) || isNaN(polyHomePct)) {
-        continue;
+      if (polyGame) {
+        // Get Polymarket prices
+        polyAwayPct = parseFloat(polyGame['Away Implied Prob (%)']);
+        polyHomePct = parseFloat(polyGame['Home Implied Prob (%)']);
+        
+        if (!isNaN(polyAwayPct) && !isNaN(polyHomePct)) {
+          // Check arbitrage using lowest sportsbook implied probs (best odds for bettor)
+          // Option 1: Buy away on sportsbook (lowest = best odds) + buy home on Polymarket
+          // Option 2: Buy away on Polymarket + buy home on sportsbook (lowest = best odds)
+          const arb = checkArbitrage(
+            polyAwayPct,
+            polyHomePct,
+            sbLines.lowestAwayImplied,
+            sbLines.lowestHomeImplied
+          );
+          
+          if (arb.hasArb) {
+            hasArb = 'YES';
+            profitPercent = arb.profitPercent;
+            bestOption = arb.bestOption;
+          }
+        }
+      } else {
+        console.log(`No Polymarket match found for: ${firstSBGame['Away Team']} @ ${firstSBGame['Home Team']}`);
       }
-      
-      // Check arbitrage using lowest sportsbook implied probs (best odds for bettor)
-      // Option 1: Buy away on sportsbook (lowest = best odds) + buy home on Polymarket
-      // Option 2: Buy away on Polymarket + buy home on sportsbook (lowest = best odds)
-      const arb = checkArbitrage(
-        polyAwayPct,
-        polyHomePct,
-        sbLines.lowestAwayImplied,
-        sbLines.lowestHomeImplied
-      );
       
       results.push({
         date: firstSBGame.Date,
@@ -282,15 +293,15 @@ function main() {
         awayTeam: firstSBGame['Away Team'],
         homeTeam: firstSBGame['Home Team'],
         status: firstSBGame.Status,
-        hasArb: arb.hasArb ? 'YES' : 'NO',
+        hasArb: hasArb,
         lowestAwayBookmaker: sbLines.lowestAwayBookmaker,
         lowestAwayImplied: sbLines.lowestAwayImplied.toFixed(2),
         lowestHomeBookmaker: sbLines.lowestHomeBookmaker,
         lowestHomeImplied: sbLines.lowestHomeImplied.toFixed(2),
         polyAwayImplied: polyAwayPct.toFixed(2),
         polyHomeImplied: polyHomePct.toFixed(2),
-        profitPercent: arb.profitPercent.toFixed(2),
-        bestOption: arb.bestOption.toFixed(4)
+        profitPercent: profitPercent.toFixed(2),
+        bestOption: bestOption.toFixed(4)
       });
     }
     
@@ -330,7 +341,7 @@ function main() {
         `"${result.awayTeam}"`,
         `"${result.homeTeam}"`,
         `"${result.status}"`,
-        result.hasArb,
+        `"${result.hasArb}"`,
         `"${result.lowestAwayBookmaker}"`,
         result.lowestAwayImplied,
         `"${result.lowestHomeBookmaker}"`,
