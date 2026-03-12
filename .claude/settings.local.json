@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:docs.polymarket.com)",
+      "WebSearch",
+      "Bash(python3:*)",
+      "WebFetch(domain:docs.polymarket.us)",
+      "WebFetch(domain:gamma-api.polymarket.com)",
+      "Bash(npm install:*)",
+      "Bash(node:*)",
+      "WebFetch(domain:polygonscan.com)",
+      "WebFetch(domain:docs.predexon.com)",
+      "WebFetch(domain:api.predexon.com)",
+      "Bash(cd /Users/amanshah/Documents/Hackathons/polyArb/next-frontend && npx tsc --noEmit 2>&1 | head -50)",
+      "Bash(npx tsc:*)",
+      "Bash(npm run:*)",
+      "Read(//Users/amanshah/Documents/Slideshows/**)",
+      "Bash(mkdir -p ~/Documents/slideshows)",
+      "Bash(open ~/Documents/slideshows/safira-pitch.html)"
+    ]
+  }
+}

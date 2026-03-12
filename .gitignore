@@ -1,5 +1,6 @@
 # Environment variables
 .env
+polyarb.txt
 
 # Output files
 outputs/
@@ -9,4 +10,5 @@ node_modules/
 
 # Logs
 *.log
+
 

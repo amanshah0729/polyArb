@@ -8,7 +8,7 @@ Get a list of in-season sports
 
 Details
 
-GET /v4/sports?apiKey=YOUR_API_KEY(opens new window)
+GET /v4/sports?apiKey=YOUR_OPENAPI_API_KEY(opens new window)
 
 {
   "key": "americanfootball_nfl",
@@ -29,7 +29,7 @@ Use the oddsFormat parameter to show odds in either decimal or American format
 
 Details
 
-GET /v4/sports/americanfootball_nfl/odds?regions=us&oddsFormat=american&apiKey=YOUR_API_KEY(opens new window)
+GET /v4/sports/americanfootball_nfl/odds?regions=us&oddsFormat=american&apiKey=YOUR_OPENAPI_API_KEY(opens new window)
 
 {
   "id": "bda33adca828c09dc3cac3a856aef176",
@@ -78,7 +78,7 @@ all   Optional - if this parameter is set to true (all=true), a list of both in 
 
 Try it out in the browser
 
-https://api.the-odds-api.com/v4/sports/?apiKey=YOUR_API_KEY(opens new window)
+https://api.the-odds-api.com/v4/sports/?apiKey=YOUR_OPENAPI_API_KEY(opens new window)
 
 Viewing JSON in the browser is easier with a prettifier such as JSON Viewer (opens new window)for Chrome
 
@@ -86,7 +86,7 @@ Viewing JSON in the browser is easier with a prettifier such as JSON Viewer (ope
 For a detailed API spec, see the Swagger API docs(opens new window)
 
 #Example Request
-GET https://api.the-odds-api.com/v4/sports/?apiKey=YOUR_API_KEY(opens new window)
+GET https://api.the-odds-api.com/v4/sports/?apiKey=YOUR_OPENAPI_API_KEY(opens new window)
 
 #Example Response
 [

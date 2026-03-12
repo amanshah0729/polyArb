@@ -8,13 +8,16 @@
     "getNBAGames": "node getNBAGames.js",
     "getPolymarketNBA": "node getPolymarketNBA.js",
     "findArbitrage": "node findArbitrage.js",
-    "findAllArbitrage": "node findAllArbitrage.js"
+    "findAllArbitrage": "node findAllArbitrage.js",
+    "deriveCredentials": "node scripts/polymarket/deriveCredentials.js",
+    "betNo": "node scripts/polymarket/betNo.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "dotenv": "^16.3.1"
+    "@polymarket/clob-client": "^5.2.4",
+    "dotenv": "^16.3.1",
+    "ethers": "^5.8.0"
   }
 }
-

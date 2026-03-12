@@ -3,15 +3,15 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
-const API_KEY = process.env.API_KEY;
+const OPENAPI_API_KEY = process.env.OPENAPI_API_KEY;
 
-if (!API_KEY) {
-  console.error('Error: API_KEY not found in .env file');
+if (!OPENAPI_API_KEY) {
+  console.error('Error: OPENAPI_API_KEY not found in .env file');
   process.exit(1);
 }
 
 const BASE_URL = 'https://api.the-odds-api.com';
-const ENDPOINT = `/v4/sports/?apiKey=${API_KEY}`;
+const ENDPOINT = `/v4/sports/?apiKey=${OPENAPI_API_KEY}`;
 
 const url = `${BASE_URL}${ENDPOINT}`;
 

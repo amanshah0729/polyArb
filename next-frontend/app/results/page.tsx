@@ -1,24 +1,40 @@
 import fs from 'fs';
 import path from 'path';
+import { Suspense } from 'react';
+import ResultsClient from './ResultsClient';
+import RerunButton from './RerunButton';
+import TabBar from './TabBar';
 
-// Force dynamic rendering to prevent caching
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-export default function Results() {
-  const dir = path.join('c:', 'Users', '21rah', 'OneDrive', 'Documents', 'polyArb', 'outputs', 'final_arb');
+// ── Shared helpers ────────────────────────────────────────────────────────────
+
+function cleanCell(cell: string) {
+  return cell.replace(/"/g, '').trim();
+}
+
+function EmptyState({ message }: { message: string }) {
+  return (
+    <div className="p-12 text-center">
+      <p className="text-[#9ca3af]">{message}</p>
+    </div>
+  );
+}
+
+// ── Sportsbook tab ────────────────────────────────────────────────────────────
+
+function SportsbookContent() {
+  const projectRoot = path.resolve(process.cwd(), '..');
+  const dir = path.join(projectRoot, 'outputs', 'final_arb');
   let files: string[] = [];
+  let lastPulledTimestamp: Date | undefined;
+
   try {
-    // Get today's date in YYYY-MM-DD format
     const today = new Date().toISOString().split('T')[0];
-    
-    // Only read files from today
     const allFiles = fs.readdirSync(dir).filter((f: string) => f.startsWith('arb_') && f.endsWith('.csv'));
-    
-    // Filter to only today's files
     files = allFiles.filter((f: string) => f.includes(today)).sort();
-    
-    // If no files for today, get the most recent files for each sport
+
     if (files.length === 0) {
       const sportFiles: { [key: string]: string } = {};
       allFiles.forEach((file: string) => {
@@ -33,101 +49,70 @@ export default function Results() {
       });
       files = Object.values(sportFiles).sort();
     }
-  } catch (error) {
-    return (
-      <div className="min-h-screen bg-[#0f172a] flex items-center justify-center">
-        <div className="max-w-[1200px] mx-auto px-4">
-          <div className="bg-[#111827] rounded-xl shadow-2xl border border-[rgba(255,255,255,0.08)] p-8 text-center">
-            <h1 className="text-2xl font-bold text-[#e5e7eb] mb-2">Arbitrage Results</h1>
-            <p className="text-[#9ca3af]">Error reading results directory.</p>
-          </div>
-        </div>
-      </div>
-    );
+
+    if (files.length > 0) {
+      let mostRecentTime = 0;
+      files.forEach((file: string) => {
+        const stats = fs.statSync(path.join(dir, file));
+        if (stats.mtime.getTime() > mostRecentTime) {
+          mostRecentTime = stats.mtime.getTime();
+          lastPulledTimestamp = stats.mtime;
+        }
+      });
+    }
+  } catch {
+    return <EmptyState message="Error reading sportsbook results directory." />;
   }
 
-  if (files.length === 0) {
-    return (
-      <div className="min-h-screen bg-[#0f172a] flex items-center justify-center">
-        <div className="max-w-[1200px] mx-auto px-4">
-          <div className="bg-[#111827] rounded-xl shadow-2xl border border-[rgba(255,255,255,0.08)] p-8 text-center">
-            <h1 className="text-2xl font-bold text-[#e5e7eb] mb-2">Arbitrage Results</h1>
-            <p className="text-[#9ca3af]">No results found yet.</p>
-          </div>
-        </div>
-      </div>
-    );
-  }
+  if (files.length === 0) return <EmptyState message="No sportsbook results found. Click Recalculate Arb to run the scanner." />;
 
-  // Combine all arbitrage data from all files
-  const allRows: string[][] = [];
+  const allRows: Array<{ row: string[]; sport: string }> = [];
   let originalHeaders: string[] = [];
 
   files.forEach((file: string) => {
     try {
+      const sportMatch = file.match(/arb_(nba|nfl|nhl)_/);
+      const sport = sportMatch ? sportMatch[1].toUpperCase() : 'UNKNOWN';
       const content = fs.readFileSync(path.join(dir, file), 'utf-8');
       const lines = content.split('\n').filter((l: string) => l.trim());
       if (lines.length > 0) {
-        if (originalHeaders.length === 0) {
-          originalHeaders = lines[0].split(',');
-        }
-        // Skip header and add data rows
-        const dataRows = lines.slice(1).map((line: string) => line.split(','));
-        allRows.push(...dataRows);
+        if (originalHeaders.length === 0) originalHeaders = lines[0].split(',');
+        allRows.push(...lines.slice(1).map((line: string) => ({ row: line.split(','), sport })));
       }
-    } catch (error) {
-      console.error(`Error reading file ${file}:`, error);
-    }
+    } catch { /* skip bad file */ }
   });
 
-  // Find column indices
-  const getColumnIndex = (name: string) => {
-    return originalHeaders.findIndex(h => h.replace(/"/g, '').trim() === name);
-  };
+  if (allRows.length === 0) return <EmptyState message="No arbitrage data found." />;
 
-  const bestOptionCostIdx = getColumnIndex('Best Option Cost');
-  const awayTeamIdx = getColumnIndex('Away Team');
-  const homeTeamIdx = getColumnIndex('Home Team');
-  const dateIdx = getColumnIndex('Date');
-  const timeIdx = getColumnIndex('Time');
-  const statusIdx = getColumnIndex('Status');
-  const arbOppIdx = getColumnIndex('Arb Opportunity');
-  const lowestAwayBookIdx = getColumnIndex('Lowest Away Bookmaker');
-  const lowestAwayImpliedIdx = getColumnIndex('Lowest Away Implied Prob (%)');
-  const lowestHomeBookIdx = getColumnIndex('Lowest Home Bookmaker');
-  const lowestHomeImpliedIdx = getColumnIndex('Lowest Home Implied Prob (%)');
-  const polyAwayImpliedIdx = getColumnIndex('Polymarket Away Implied Prob (%)');
-  const polyHomeImpliedIdx = getColumnIndex('Polymarket Home Implied Prob (%)');
-  const profitIdx = getColumnIndex('Profit %');
+  const idx = (name: string) => originalHeaders.findIndex(h => h.replace(/"/g, '').trim() === name);
+  const bestOptionCostIdx   = idx('Best Option Cost');
+  const awayTeamIdx         = idx('Away Team');
+  const homeTeamIdx         = idx('Home Team');
+  const dateIdx             = idx('Date');
+  const timeIdx             = idx('Time');
+  const statusIdx           = idx('Status');
+  const arbOppIdx           = idx('Arb Opportunity');
+  const lowestAwayBookIdx   = idx('Lowest Away Bookmaker');
+  const lowestAwayImpliedIdx = idx('Lowest Away Implied Prob (%)');
+  const lowestHomeBookIdx   = idx('Lowest Home Bookmaker');
+  const lowestHomeImpliedIdx = idx('Lowest Home Implied Prob (%)');
+  const polyAwayImpliedIdx  = idx('Polymarket Away Implied Prob (%)');
+  const polyHomeImpliedIdx  = idx('Polymarket Home Implied Prob (%)');
+  const profitIdx           = idx('Profit %');
 
-  // Create new headers with Best Option Cost first, and Game instead of Away/Home Team
   const headers = [
-    'Best Option Cost',
-    'Date',
-    'Time',
-    'Game',
-    'Status',
-    'Arb Opportunity',
-    'Lowest Away Bookmaker',
-    'Lowest Away Implied Prob (%)',
-    'Lowest Home Bookmaker',
-    'Lowest Home Implied Prob (%)',
-    'Polymarket Away Implied Prob (%)',
-    'Polymarket Home Implied Prob (%)',
-    'Profit %'
+    'Best Option Cost', 'Date', 'Time', 'Game', 'Status', 'Arb Opportunity',
+    'Lowest Away Bookmaker', 'Lowest Away Implied Prob (%)',
+    'Lowest Home Bookmaker', 'Lowest Home Implied Prob (%)',
+    'Polymarket Away Implied Prob (%)', 'Polymarket Home Implied Prob (%)', 'Profit %',
   ];
 
-  // Transform rows to match new column order
-  const transformedRows = allRows.map((row: string[]) => {
-    const cleanCell = (cell: string) => cell.replace(/"/g, '').trim();
-    
-    return [
+  const transformedRows = allRows.map(({ row, sport }) => ({
+    data: [
       bestOptionCostIdx >= 0 ? cleanCell(row[bestOptionCostIdx]) : '',
       dateIdx >= 0 ? cleanCell(row[dateIdx]) : '',
       timeIdx >= 0 ? cleanCell(row[timeIdx]).replace(/:00 /, ' ') : '',
-      awayTeamIdx >= 0 && homeTeamIdx >= 0 
-        ? `${cleanCell(row[awayTeamIdx])} vs ${cleanCell(row[homeTeamIdx])}`
-        : '',
+      awayTeamIdx >= 0 && homeTeamIdx >= 0 ? `${cleanCell(row[awayTeamIdx])} (A) @ ${cleanCell(row[homeTeamIdx])} (H)` : '',
       statusIdx >= 0 ? cleanCell(row[statusIdx]) : '',
       arbOppIdx >= 0 ? cleanCell(row[arbOppIdx]) : '',
       lowestAwayBookIdx >= 0 ? cleanCell(row[lowestAwayBookIdx]) : '',
@@ -136,114 +121,329 @@ export default function Results() {
       lowestHomeImpliedIdx >= 0 ? cleanCell(row[lowestHomeImpliedIdx]) : '',
       polyAwayImpliedIdx >= 0 ? cleanCell(row[polyAwayImpliedIdx]) : '',
       polyHomeImpliedIdx >= 0 ? cleanCell(row[polyHomeImpliedIdx]) : '',
-      profitIdx >= 0 ? cleanCell(row[profitIdx]) : ''
-    ];
-  });
+      profitIdx >= 0 ? cleanCell(row[profitIdx]) : '',
+    ],
+    sport,
+  }));
 
-  if (allRows.length === 0) {
-    return (
-      <div className="min-h-screen bg-[#0f172a] flex items-center justify-center">
-        <div className="max-w-[1200px] mx-auto px-4">
-          <div className="bg-[#111827] rounded-xl shadow-2xl border border-[rgba(255,255,255,0.08)] p-8 text-center">
-            <h1 className="text-2xl font-bold text-[#e5e7eb] mb-2">Arbitrage Results</h1>
-            <p className="text-[#9ca3af]">No arbitrage data found.</p>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // Sort rows so YES opportunities come first (Arb Opportunity is now at index 5)
-  transformedRows.sort((a: string[], b: string[]) => {
-    const aIsYes = a[5] === 'YES';
-    const bIsYes = b[5] === 'YES';
-    if (aIsYes && !bIsYes) return -1;
-    if (!aIsYes && bIsYes) return 1;
-    return 0;
+  transformedRows.sort((a, b) => {
+    const aYes = a.data[5] === 'YES', bYes = b.data[5] === 'YES';
+    return aYes === bYes ? 0 : aYes ? -1 : 1;
   });
 
   return (
-    <div className="min-h-screen bg-[#0f172a] py-12 px-4">
-      <div className="max-w-[1200px] mx-auto">
-        <div className="bg-[#111827] rounded-xl shadow-2xl border border-[rgba(255,255,255,0.08)] transition-all">
-          <div className="bg-[#1f2937] px-8 py-6 border-b border-[rgba(255,255,255,0.08)]">
-            <h1 className="text-4xl font-bold text-[#e5e7eb] mb-2 tracking-tight">Arbitrage Results</h1>
-            <p className="text-[#9ca3af] text-sm font-medium">NFL, NHL, NBA</p>
-          </div>
-          <div className="overflow-x-auto">
-            <table className="w-full border-collapse min-w-full" style={{ tableLayout: 'auto' }}>
-              <thead className="sticky top-0 z-10">
-                <tr className="bg-[#1f2937] border-b border-[rgba(255,255,255,0.08)]">
-                  {headers.map((h: string, i: number) => (
-                    <th 
-                      key={i} 
-                      className="px-[18px] py-[14px] text-left text-[0.9rem] font-medium text-[#e5e7eb] uppercase tracking-wider whitespace-nowrap leading-[1.4]"
-                    >
-                      {h.replace('Arb Opportunity', 'Arbitrage Opportunity')}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {transformedRows.map((row: string[], i: number) => {
-                  const isOpportunity = row[5] === 'YES';
-                  
-                  // Calculate which combination has the smallest sum
-                  // Column indices: 7=Lowest Away, 9=Lowest Home, 10=Poly Away, 11=Poly Home
-                  const lowestAway = parseFloat(row[7]) || 0;
-                  const lowestHome = parseFloat(row[9]) || 0;
-                  const polyAway = parseFloat(row[10]) || 0;
-                  const polyHome = parseFloat(row[11]) || 0;
-                  
-                  // Combination A: Lowest Away + Polymarket Home
-                  const combinationA = lowestAway + polyHome;
-                  // Combination B: Polymarket Away + Lowest Home
-                  const combinationB = polyAway + lowestHome;
-                  
-                  // Determine which columns to highlight based on smallest combination
-                  const highlightColumns: number[] = [];
-                  if (combinationA < combinationB) {
-                    // Highlight: Lowest Away (7) and Polymarket Home (11)
-                    highlightColumns.push(7, 11);
-                  } else {
-                    // Highlight: Polymarket Away (10) and Lowest Home (9)
-                    highlightColumns.push(10, 9);
-                  }
-                  
-                  return (
-                    <tr 
-                      key={i} 
-                      className={`border-b border-[rgba(255,255,255,0.08)] transition-[background-color] duration-200 ease-in-out ${
-                        isOpportunity 
-                          ? 'bg-[rgba(34,197,94,0.1)] hover:bg-[rgba(56,189,248,0.08)]' 
-                          : i % 2 === 0 
-                            ? 'bg-[#111827] hover:bg-[rgba(56,189,248,0.08)]' 
-                            : 'bg-[rgba(255,255,255,0.02)] hover:bg-[rgba(56,189,248,0.08)]'
-                      }`}
-                    >
-                      {row.map((cell: string, j: number) => {
-                        let cellClass = "px-[18px] py-5 text-sm text-[#e5e7eb] whitespace-nowrap";
-                        if (isOpportunity) {
-                          cellClass += " font-semibold text-[#22c55e]";
-                        }
-                        // Highlight the columns that form the best combination (smallest sum)
-                        if (isOpportunity && highlightColumns.includes(j)) {
-                          cellClass += " text-[#fbbf24]";
-                        }
+    <>
+      <div className="bg-[#1f2937] px-8 py-5 flex items-center justify-between border-b border-[rgba(255,255,255,0.08)]">
+        <div>
+          <p className="text-[#9ca3af] text-sm font-medium">NFL · NHL · NBA</p>
+          {lastPulledTimestamp && (
+            <p className="text-[#9ca3af] text-xs mt-1">Last pulled: {lastPulledTimestamp.toLocaleString()}</p>
+          )}
+        </div>
+        <RerunButton />
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full border-collapse min-w-full" style={{ tableLayout: 'auto' }}>
+          <thead className="sticky top-0 z-10">
+            <tr className="bg-[#1f2937] border-b border-[rgba(255,255,255,0.08)]">
+              {headers.map((h, i) => (
+                <th key={i} className="px-[18px] py-[14px] text-left text-[0.9rem] font-medium text-[#e5e7eb] uppercase tracking-wider whitespace-nowrap">
+                  {h.replace('Arb Opportunity', 'Arbitrage Opportunity')}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {transformedRows.map(({ data: row, sport }, i) => {
+              const isOpportunity = row[5] === 'YES';
+              const lowestAway = parseFloat(row[7]) || 0;
+              const lowestHome = parseFloat(row[9]) || 0;
+              const polyAway   = parseFloat(row[10]) || 0;
+              const polyHome   = parseFloat(row[11]) || 0;
+              const highlightCols = lowestAway + polyHome < polyAway + lowestHome ? [7, 11] : [10, 9];
+
+              return (
+                <tr key={i} className={`border-b border-[rgba(255,255,255,0.08)] transition-colors duration-150 ${
+                  isOpportunity ? 'bg-[rgba(34,197,94,0.1)] hover:bg-[rgba(56,189,248,0.08)]'
+                    : i % 2 === 0 ? 'bg-[#111827] hover:bg-[rgba(56,189,248,0.08)]'
+                    : 'bg-[rgba(255,255,255,0.02)] hover:bg-[rgba(56,189,248,0.08)]'
+                }`}>
+                  {row.map((cell, j) => {
+                    let cls = 'px-[18px] py-5 text-sm text-[#e5e7eb] whitespace-nowrap';
+                    if (isOpportunity) cls += ' font-semibold text-[#22c55e]';
+                    if (isOpportunity && highlightCols.includes(j)) cls += ' text-[#fbbf24]';
+
+                    if (j === 3) {
+                      const parts = cell.split(' (A) @ ');
+                      if (parts.length === 2) {
+                        const away = parts[0], home = parts[1].replace(' (H)', '');
                         return (
-                          <td key={j} className={cellClass}>
-                            {cell}
+                          <td key={j} className={cls}>
+                            <span className="text-[#60a5fa] font-semibold mr-2">[{sport}]</span>
+                            <span className="text-[#9ca3af]">{away}</span>
+                            <span className="text-[#6b7280] mx-2">(A) @</span>
+                            <span className="text-[#9ca3af]">{home}</span>
+                            <span className="text-[#6b7280] ml-1">(H)</span>
                           </td>
                         );
-                      })}
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                      }
+                    }
+                    return <td key={j} className={cls}>{cell}</td>;
+                  })}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}
+
+// ── Pred Market tab ───────────────────────────────────────────────────────────
+
+function PredMarketContent() {
+  const projectRoot = path.resolve(process.cwd(), '..');
+  const dir = path.join(projectRoot, 'outputs', 'predexon');
+  let lastPulledTimestamp: Date | null = null;
+
+  let rows: string[][] = [];
+  let headers: string[] = [];
+
+  try {
+    const allFiles = fs.readdirSync(dir)
+      .filter((f: string) => f.startsWith('arb_predexon_') && f.endsWith('.csv'))
+      .sort()
+      .reverse(); // most recent first
+
+    if (allFiles.length === 0) {
+      return <EmptyState message="No pred market results yet. Click 'Refresh Pred Market Arb' to scan." />;
+    }
+
+    const latestFile = allFiles[0];
+    const stats = fs.statSync(path.join(dir, latestFile));
+    lastPulledTimestamp = stats.mtime;
+
+    const content = fs.readFileSync(path.join(dir, latestFile), 'utf-8');
+    const lines = content.split('\n').filter((l: string) => l.trim());
+    if (lines.length < 2) return <EmptyState message="Scan file is empty. Run the scanner again." />;
+
+    headers = lines[0].split(',').map(h => cleanCell(h));
+
+    // Parse CSV rows (handle quoted commas in title)
+    for (let i = 1; i < lines.length; i++) {
+      const cells: string[] = [];
+      let cur = '';
+      let inQuote = false;
+      for (const ch of lines[i]) {
+        if (ch === '"') { inQuote = !inQuote; }
+        else if (ch === ',' && !inQuote) { cells.push(cur); cur = ''; }
+        else cur += ch;
+      }
+      cells.push(cur);
+      if (cells.length >= headers.length) rows.push(cells.map(c => c.replace(/"/g, '').trim()));
+    }
+  } catch {
+    return <EmptyState message="Error reading pred market results directory." />;
+  }
+
+  if (rows.length === 0) return <EmptyState message="No arbitrage opportunities found. Try running the scanner." />;
+
+  const idx = (name: string) => headers.indexOf(name);
+  const titleIdx     = idx('Title');
+  const simIdx       = idx('Similarity%');
+  const stratIdx     = idx('Strategy');
+  const profitPctIdx = idx('Profit%');
+  const polyYesIdx   = idx('Poly YES');
+  const polyNoIdx    = idx('Poly NO');
+  const kYesAskIdx   = idx('Kalshi YES Ask');
+  const kNoAskIdx    = idx('Kalshi NO Ask');
+  const kYesBidIdx   = idx('Kalshi YES Bid');
+  const kNoBidIdx    = idx('Kalshi NO Bid');
+  const costIdx      = idx('Arb Cost');
+  const expiresIdx   = idx('Expires');
+  const tickerIdx    = idx('Kalshi Ticker');
+
+  // APY = (1 + profit%)^(365/days) - 1
+  // Returns null if expiry unknown or already passed
+  function calcAPY(profitPct: number, expiresStr: string): number | null {
+    if (!expiresStr || expiresStr === '—') return null;
+    const expiry = new Date(expiresStr);
+    const days = (expiry.getTime() - Date.now()) / 86400000;
+    if (days <= 0) return null;
+    return (Math.pow(1 + profitPct / 100, 365 / days) - 1) * 100;
+  }
+
+  const STABLECOIN_APY = 5; // % benchmark
+
+  const tableHeaders = [
+    '#', 'Profit %', 'APY (ann.)', 'Market', 'Strategy',
+    'Poly YES', 'Poly NO',
+    'Kalshi Ask (Y / N)', 'Kalshi Bid (Y / N)',
+    'Arb Cost', 'Sim', 'Expires',
+  ];
+
+  return (
+    <>
+      <div className="bg-[#1f2937] px-8 py-5 flex items-center justify-between border-b border-[rgba(255,255,255,0.08)]">
+        <div>
+          <p className="text-[#9ca3af] text-sm font-medium">Polymarket ↔ Kalshi · buy &amp; hold to resolution · ask prices only</p>
+          {lastPulledTimestamp && (
+            <p className="text-[#9ca3af] text-xs mt-1">Last pulled: {lastPulledTimestamp.toLocaleString()}</p>
+          )}
+        </div>
+        <RerunButton
+          apiRoute="/api/run-predexon-arb"
+          label="Refresh Pred Market Arb"
+          loadingLabel="Scanning..."
+        />
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full border-collapse min-w-full" style={{ tableLayout: 'auto' }}>
+          <thead className="sticky top-0 z-10">
+            <tr className="bg-[#1f2937] border-b border-[rgba(255,255,255,0.08)]">
+              {tableHeaders.map((h, i) => (
+                <th key={i} className="px-[18px] py-[14px] text-left text-[0.9rem] font-medium text-[#e5e7eb] uppercase tracking-wider whitespace-nowrap">
+                  {h}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row, i) => {
+              const profitPct = parseFloat(row[profitPctIdx] ?? '0');
+              const expiresStr = row[expiresIdx] ?? '—';
+              const apy = calcAPY(profitPct, expiresStr);
+              const beatsStablecoin = apy !== null && apy >= STABLECOIN_APY;
+
+              const rowBg = i % 2 === 0
+                ? 'bg-[#111827] hover:bg-[rgba(56,189,248,0.08)]'
+                : 'bg-[rgba(255,255,255,0.02)] hover:bg-[rgba(56,189,248,0.08)]';
+
+              const cellBase = 'px-[18px] py-4 text-sm text-[#e5e7eb] whitespace-nowrap';
+              const title = row[titleIdx] ?? '';
+              const strategy = (row[stratIdx] ?? '')
+                .replace('@Polymarket', '@Poly')
+                .replace('@Kalshi', '@K');
+
+              return (
+                <tr key={i} className={`border-b border-[rgba(255,255,255,0.08)] transition-colors duration-150 ${rowBg}`}>
+                  {/* # */}
+                  <td className={`${cellBase} text-[#6b7280] font-medium`}>{i + 1}</td>
+
+                  {/* Profit % */}
+                  <td className={`${cellBase} font-semibold text-[#e5e7eb]`}>
+                    {profitPct.toFixed(2)}%
+                  </td>
+
+                  {/* APY */}
+                  <td className={cellBase}>
+                    {apy === null ? (
+                      <span className="text-[#6b7280]">—</span>
+                    ) : beatsStablecoin ? (
+                      <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-[rgba(34,197,94,0.15)] text-[#22c55e]">
+                        {apy.toFixed(1)}%
+                      </span>
+                    ) : (
+                      <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-[rgba(239,68,68,0.12)] text-[#f87171]">
+                        {apy.toFixed(1)}%
+                      </span>
+                    )}
+                  </td>
+
+                  {/* Market title */}
+                  <td className={`${cellBase} max-w-[300px]`}>
+                    <span className="block truncate text-[#e5e7eb]" title={title}>
+                      {title}
+                    </span>
+                    {tickerIdx >= 0 && (
+                      <span className="block text-[#60a5fa] text-xs mt-0.5 font-mono">
+                        {row[tickerIdx]}
+                      </span>
+                    )}
+                  </td>
+
+                  {/* Strategy */}
+                  <td className={`${cellBase} text-[#9ca3af]`}>{strategy}</td>
+
+                  {/* Poly YES */}
+                  <td className={`${cellBase} font-mono text-[#a78bfa]`}>{row[polyYesIdx] ?? '—'}</td>
+
+                  {/* Poly NO */}
+                  <td className={`${cellBase} font-mono text-[#a78bfa]`}>{row[polyNoIdx] ?? '—'}</td>
+
+                  {/* Kalshi Ask YES / NO */}
+                  <td className={cellBase}>
+                    <div className="flex gap-3 font-mono text-[#fbbf24]">
+                      <span><span className="text-[#6b7280] text-xs">Y </span>{row[kYesAskIdx] ?? '—'}</span>
+                      <span><span className="text-[#6b7280] text-xs">N </span>{row[kNoAskIdx] ?? '—'}</span>
+                    </div>
+                  </td>
+
+                  {/* Kalshi Bid YES / NO (liquidity reference only) */}
+                  <td className={cellBase}>
+                    <div className="flex gap-3 font-mono text-[#6b7280]">
+                      <span><span className="text-xs">Y </span>{row[kYesBidIdx] ?? '—'}</span>
+                      <span><span className="text-xs">N </span>{row[kNoBidIdx] ?? '—'}</span>
+                    </div>
+                  </td>
+
+                  {/* Arb Cost */}
+                  <td className={`${cellBase} font-mono text-[#e5e7eb]`}>{row[costIdx] ?? '—'}</td>
+
+                  {/* Similarity */}
+                  <td className={cellBase}>
+                    <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-[rgba(96,165,250,0.15)] text-[#60a5fa]">
+                      {row[simIdx] ?? '?'}%
+                    </span>
+                  </td>
+
+                  {/* Expires */}
+                  <td className={`${cellBase} text-[#9ca3af] font-mono`}>{expiresStr}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}
+
+// ── Page ──────────────────────────────────────────────────────────────────────
+
+export default async function Results({
+  searchParams,
+}: {
+  searchParams: Promise<{ tab?: string }>;
+}) {
+  const { tab } = await searchParams;
+  const isPredMarket = tab === 'predmarket';
+
+  return (
+    <ResultsClient>
+      <div className="min-h-screen bg-[#0f172a] py-12 px-4">
+        <div className="max-w-[1400px] mx-auto">
+          <div className="bg-[#111827] rounded-xl shadow-2xl border border-[rgba(255,255,255,0.08)]">
+
+            {/* Header */}
+            <div className="bg-[#1f2937] px-8 pt-6 border-b-0 rounded-t-xl">
+              <h1 className="text-4xl font-bold text-[#e5e7eb] tracking-tight">
+                Arbitrage Results
+              </h1>
+            </div>
+
+            {/* Tabs */}
+            <Suspense fallback={null}>
+              <TabBar />
+            </Suspense>
+
+            {/* Tab content */}
+            {isPredMarket ? <PredMarketContent /> : <SportsbookContent />}
+
           </div>
         </div>
       </div>
-    </div>
+    </ResultsClient>
   );
 }

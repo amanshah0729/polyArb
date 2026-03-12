@@ -5,10 +5,10 @@ const path = require('path');
 const { deVigOdds } = require('../utils/deVig');
 const { findArbitrageOpportunities } = require('../utils/arbitrage');
 
-const API_KEY = process.env.API_KEY;
+const OPENAPI_API_KEY = process.env.OPENAPI_API_KEY;
 
-if (!API_KEY) {
-  console.error('Error: API_KEY not found in .env file');
+if (!OPENAPI_API_KEY) {
+  console.error('Error: OPENAPI_API_KEY not found in .env file');
   process.exit(1);
 }
 
@@ -18,7 +18,7 @@ const REGIONS = 'us';
 const MARKETS = 'h2h';
 const ODDS_FORMAT = 'american';
 
-const ENDPOINT = `/v4/sports/${SPORT}/odds/?apiKey=${API_KEY}&regions=${REGIONS}&markets=${MARKETS}&oddsFormat=${ODDS_FORMAT}`;
+const ENDPOINT = `/v4/sports/${SPORT}/odds/?apiKey=${OPENAPI_API_KEY}&regions=${REGIONS}&markets=${MARKETS}&oddsFormat=${ODDS_FORMAT}`;
 
 const url = `${BASE_URL}${ENDPOINT}`;
 
