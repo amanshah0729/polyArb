@@ -1,0 +1,2 @@
+- [BFA Arb Notifications](project_arb_notifications.md) — automated email alerts for BFA↔Poly arb, Resend + Render deploy
+- [Email privacy](feedback_email_privacy.md) — never hardcode user email, always use env var

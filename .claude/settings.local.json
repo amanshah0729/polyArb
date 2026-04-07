@@ -16,7 +16,9 @@
       "Bash(npm run:*)",
       "Read(//Users/amanshah/Documents/Slideshows/**)",
       "Bash(mkdir -p ~/Documents/slideshows)",
-      "Bash(open ~/Documents/slideshows/safira-pitch.html)"
+      "Bash(open ~/Documents/slideshows/safira-pitch.html)",
+      "Bash(curl -s \"https://api.bfagaming.com/oddsservice/sports\" -H \"User-Agent: Mozilla/5.0\")",
+      "Bash(curl -s \"https://gamma-api.polymarket.com/events?tag_id=745&closed=false&limit=5\")"
     ]
   }
 }

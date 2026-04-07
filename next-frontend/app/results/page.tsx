@@ -209,6 +209,7 @@ function PredMarketContent() {
 
   let rows: string[][] = [];
   let headers: string[] = [];
+  let emptyMessage: string | null = null;
 
   try {
     const allFiles = fs.readdirSync(dir)
@@ -217,37 +218,40 @@ function PredMarketContent() {
       .reverse(); // most recent first
 
     if (allFiles.length === 0) {
-      return <EmptyState message="No pred market results yet. Click 'Refresh Pred Market Arb' to scan." />;
-    }
+      emptyMessage = "No pred market results yet. Click 'Refresh Pred Market Arb' to scan.";
+    } else {
+      const latestFile = allFiles[0];
+      const stats = fs.statSync(path.join(dir, latestFile));
+      lastPulledTimestamp = stats.mtime;
 
-    const latestFile = allFiles[0];
-    const stats = fs.statSync(path.join(dir, latestFile));
-    lastPulledTimestamp = stats.mtime;
+      const content = fs.readFileSync(path.join(dir, latestFile), 'utf-8');
+      const lines = content.split('\n').filter((l: string) => l.trim());
 
-    const content = fs.readFileSync(path.join(dir, latestFile), 'utf-8');
-    const lines = content.split('\n').filter((l: string) => l.trim());
-    if (lines.length < 2) return <EmptyState message="Scan file is empty. Run the scanner again." />;
+      if (lines.length < 2) {
+        emptyMessage = "No arbitrage opportunities found. Try running the scanner.";
+      } else {
+        headers = lines[0].split(',').map(h => cleanCell(h));
 
-    headers = lines[0].split(',').map(h => cleanCell(h));
+        // Parse CSV rows (handle quoted commas in title)
+        for (let i = 1; i < lines.length; i++) {
+          const cells: string[] = [];
+          let cur = '';
+          let inQuote = false;
+          for (const ch of lines[i]) {
+            if (ch === '"') { inQuote = !inQuote; }
+            else if (ch === ',' && !inQuote) { cells.push(cur); cur = ''; }
+            else cur += ch;
+          }
+          cells.push(cur);
+          if (cells.length >= headers.length) rows.push(cells.map(c => c.replace(/"/g, '').trim()));
+        }
 
-    // Parse CSV rows (handle quoted commas in title)
-    for (let i = 1; i < lines.length; i++) {
-      const cells: string[] = [];
-      let cur = '';
-      let inQuote = false;
-      for (const ch of lines[i]) {
-        if (ch === '"') { inQuote = !inQuote; }
-        else if (ch === ',' && !inQuote) { cells.push(cur); cur = ''; }
-        else cur += ch;
+        if (rows.length === 0) emptyMessage = "No arbitrage opportunities found. Try running the scanner.";
       }
-      cells.push(cur);
-      if (cells.length >= headers.length) rows.push(cells.map(c => c.replace(/"/g, '').trim()));
     }
   } catch {
-    return <EmptyState message="Error reading pred market results directory." />;
+    emptyMessage = "Error reading pred market results directory.";
   }
-
-  if (rows.length === 0) return <EmptyState message="No arbitrage opportunities found. Try running the scanner." />;
 
   const idx = (name: string) => headers.indexOf(name);
   const titleIdx     = idx('Title');
@@ -298,6 +302,9 @@ function PredMarketContent() {
           loadingLabel="Scanning..."
         />
       </div>
+      {emptyMessage ? (
+        <EmptyState message={emptyMessage} />
+      ) : (
       <div className="overflow-x-auto">
         <table className="w-full border-collapse min-w-full" style={{ tableLayout: 'auto' }}>
           <thead className="sticky top-0 z-10">
@@ -406,6 +413,286 @@ function PredMarketContent() {
           </tbody>
         </table>
       </div>
+      )}
+    </>
+  );
+}
+
+// ── BetFast tab ───────────────────────────────────────────────────────────────
+
+function BetFastContent() {
+  const projectRoot = path.resolve(process.cwd(), '..');
+  const dir = path.join(projectRoot, 'outputs', 'bfagaming');
+  let lastPulledTimestamp: Date | null = null;
+
+  let rows: string[][] = [];
+  let headers: string[] = [];
+  let emptyMessage: string | null = null;
+
+  try {
+    const allFiles = fs.readdirSync(dir)
+      .filter((f: string) => f.startsWith('arb_bfagaming_') && f.endsWith('.csv'))
+      .sort()
+      .reverse();
+
+    if (allFiles.length === 0) {
+      emptyMessage = "No BetFast results yet. Click 'Run BetFast Scanner' to scan.";
+    } else {
+      const latestFile = allFiles[0];
+      const stats = fs.statSync(path.join(dir, latestFile));
+      lastPulledTimestamp = stats.mtime;
+
+      const content = fs.readFileSync(path.join(dir, latestFile), 'utf-8');
+      const lines = content.split('\n').filter((l: string) => l.trim());
+
+      if (lines.length < 2) {
+        emptyMessage = "No games found. Try running the scanner.";
+      } else {
+        headers = lines[0].split(',').map((h: string) => cleanCell(h));
+
+        for (let i = 1; i < lines.length; i++) {
+          const cells: string[] = [];
+          let cur = '';
+          let inQuote = false;
+          for (const ch of lines[i]) {
+            if (ch === '"') { inQuote = !inQuote; }
+            else if (ch === ',' && !inQuote) { cells.push(cur); cur = ''; }
+            else cur += ch;
+          }
+          cells.push(cur);
+          if (cells.length >= headers.length) rows.push(cells.map((c: string) => c.replace(/"/g, '').trim()));
+        }
+
+        if (rows.length === 0) emptyMessage = "No games found. Try running the scanner.";
+      }
+    }
+  } catch {
+    emptyMessage = "Error reading BetFast results directory.";
+  }
+
+  const idx = (name: string) => headers.indexOf(name);
+  const dateIdx         = idx('Date');
+  const timeIdx         = idx('Time');
+  const sportIdx        = idx('Sport');
+  const awayIdx         = idx('Away Team');
+  const homeIdx         = idx('Home Team');
+  const statusIdx       = idx('Status');
+  const arbIdx          = idx('Arb Opportunity');
+  const strategyIdx     = idx('Strategy');
+  const bfaAwayOddsIdx  = idx('BFAGaming Away Odds');
+  const bfaAwayImpIdx   = idx('BFAGaming Away Implied (%)');
+  const bfaHomeOddsIdx  = idx('BFAGaming Home Odds');
+  const bfaHomeImpIdx   = idx('BFAGaming Home Implied (%)');
+  const polyAwayIdx     = idx('Polymarket Away Implied (%)');
+  const polyHomeIdx     = idx('Polymarket Home Implied (%)');
+  const profitIdx       = idx('Profit %');
+  const costIdx         = idx('Best Option Cost');
+  const bfaBetIdx       = idx('BFA Bet ($)');
+  const polyBetIdx      = idx('Poly Bet ($)');
+  const pnlIdx          = idx('Guaranteed P&L ($)');
+  const netValIdx       = idx('Net Value ($)');
+
+  const sportBadgeClass = (sport: string) => {
+    if (sport === 'NBA') return 'bg-[rgba(96,165,250,0.2)] text-[#60a5fa]';
+    if (sport === 'NHL') return 'bg-[rgba(20,184,166,0.2)] text-[#2dd4bf]';
+    return 'bg-[rgba(251,146,60,0.2)] text-[#fb923c]'; // NFL
+  };
+
+  /** "Bulls@BFA + Clippers@Poly" → two styled spans */
+  function renderStrategy(raw: string) {
+    const parts = raw.split(' + ');
+    if (parts.length !== 2) return <span className="text-[#9ca3af]">{raw}</span>;
+    return (
+      <div className="flex flex-col gap-0.5">
+        {parts.map((part, i) => {
+          const atIdx = part.lastIndexOf('@');
+          if (atIdx === -1) return <span key={i} className="text-[#9ca3af]">{part}</span>;
+          const team = part.slice(0, atIdx);
+          const platform = part.slice(atIdx + 1);
+          return (
+            <span key={i} className="text-[#9ca3af]">
+              <span className="font-semibold text-[#e5e7eb]">{team}</span>
+              <span className="text-[#6b7280] text-xs"> @{platform}</span>
+            </span>
+          );
+        })}
+      </div>
+    );
+  }
+
+  const tableHeaders = [
+    'Best Option Cost', 'Date / Time', 'Sport', 'Game', 'Status', 'Arb Opportunity',
+    'Strategy',
+    'BFA Away', 'BFA Home',
+    'Poly Away %', 'Poly Home %', 'Profit %',
+    'BFA Bet ($)', 'Poly Bet ($)', 'Guar. P&L', 'Net Value',
+  ];
+
+  const cellBase = 'px-[18px] py-5 text-sm text-[#e5e7eb] whitespace-nowrap';
+
+  return (
+    <>
+      <div className="bg-[#1f2937] px-8 py-5 flex items-center justify-between border-b border-[rgba(255,255,255,0.08)]">
+        <div>
+          <p className="text-[#9ca3af] text-sm font-medium">BetFast (bfagaming.com) ↔ Polymarket · all sports · all markets</p>
+          {lastPulledTimestamp && (
+            <p className="text-[#9ca3af] text-xs mt-1">Last pulled: {lastPulledTimestamp.toLocaleString()}</p>
+          )}
+        </div>
+        <RerunButton
+          apiRoute="/api/run-bfagaming-arb"
+          label="Run BetFast Scanner"
+          loadingLabel="Scanning..."
+        />
+      </div>
+
+      {emptyMessage ? (
+        <EmptyState message={emptyMessage} />
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full border-collapse min-w-full" style={{ tableLayout: 'auto' }}>
+            <thead className="sticky top-0 z-10">
+              <tr className="bg-[#1f2937] border-b border-[rgba(255,255,255,0.08)]">
+                {tableHeaders.map((h, i) => (
+                  <th key={i} className="px-[18px] py-[14px] text-left text-[0.9rem] font-medium text-[#e5e7eb] uppercase tracking-wider whitespace-nowrap">
+                    {h}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, i) => {
+                const isOpportunity = (row[arbIdx] ?? '') === 'YES';
+                const sport = row[sportIdx] ?? '';
+                const away = row[awayIdx] ?? '';
+                const home = row[homeIdx] ?? '';
+
+                const rowCls = `border-b border-[rgba(255,255,255,0.08)] transition-colors duration-150 ${
+                  isOpportunity
+                    ? 'bg-[rgba(34,197,94,0.1)] hover:bg-[rgba(56,189,248,0.08)]'
+                    : i % 2 === 0
+                    ? 'bg-[#111827] hover:bg-[rgba(56,189,248,0.08)]'
+                    : 'bg-[rgba(255,255,255,0.02)] hover:bg-[rgba(56,189,248,0.08)]'
+                }`;
+
+                const textCls = isOpportunity ? `${cellBase} font-semibold text-[#22c55e]` : cellBase;
+
+                return (
+                  <tr key={i} className={rowCls}>
+                    {/* Best Option Cost */}
+                    <td className={`${textCls} font-mono`}>{row[costIdx] ?? '—'}</td>
+
+                    {/* Date / Time */}
+                    <td className={cellBase}>
+                      <div className="text-[#e5e7eb]">{row[dateIdx] ?? ''}</div>
+                      <div className="text-[#6b7280] text-xs">{(row[timeIdx] ?? '').replace(/:00 /, ' ')}</div>
+                    </td>
+
+                    {/* Sport badge */}
+                    <td className={cellBase}>
+                      <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${sportBadgeClass(sport)}`}>
+                        {sport}
+                      </span>
+                    </td>
+
+                    {/* Game */}
+                    <td className={cellBase}>
+                      <span className="text-[#9ca3af]">{away}</span>
+                      <span className="text-[#6b7280] mx-2">(A) @</span>
+                      <span className="text-[#9ca3af]">{home}</span>
+                      <span className="text-[#6b7280] ml-1">(H)</span>
+                    </td>
+
+                    {/* Status */}
+                    <td className={cellBase}>{row[statusIdx] ?? ''}</td>
+
+                    {/* Arb Opportunity */}
+                    <td className={textCls}>{row[arbIdx] ?? ''}</td>
+
+                    {/* Strategy */}
+                    <td className={cellBase}>
+                      {strategyIdx >= 0 && row[strategyIdx]
+                        ? renderStrategy(row[strategyIdx])
+                        : <span className="text-[#6b7280]">—</span>}
+                    </td>
+
+                    {/* BFA Away: odds + implied combined */}
+                    <td className={`${cellBase} font-mono`}>
+                      {bfaAwayOddsIdx >= 0 && row[bfaAwayOddsIdx] ? (
+                        <div>
+                          <span className={parseFloat(row[bfaAwayOddsIdx]) > 0 ? 'text-[#22c55e]' : 'text-[#f87171]'}>
+                            {parseFloat(row[bfaAwayOddsIdx]) > 0 ? '+' : ''}{row[bfaAwayOddsIdx]}
+                          </span>
+                          <span className="text-[#6b7280] text-xs ml-1">({row[bfaAwayImpIdx]}%)</span>
+                        </div>
+                      ) : '—'}
+                    </td>
+
+                    {/* BFA Home: odds + implied combined */}
+                    <td className={`${cellBase} font-mono`}>
+                      {bfaHomeOddsIdx >= 0 && row[bfaHomeOddsIdx] ? (
+                        <div>
+                          <span className={parseFloat(row[bfaHomeOddsIdx]) > 0 ? 'text-[#22c55e]' : 'text-[#f87171]'}>
+                            {parseFloat(row[bfaHomeOddsIdx]) > 0 ? '+' : ''}{row[bfaHomeOddsIdx]}
+                          </span>
+                          <span className="text-[#6b7280] text-xs ml-1">({row[bfaHomeImpIdx]}%)</span>
+                        </div>
+                      ) : '—'}
+                    </td>
+
+                    {/* Poly Away */}
+                    <td className={`${cellBase} font-mono text-[#a78bfa]`}>{row[polyAwayIdx] ?? '—'}</td>
+
+                    {/* Poly Home */}
+                    <td className={`${cellBase} font-mono text-[#a78bfa]`}>{row[polyHomeIdx] ?? '—'}</td>
+
+                    {/* Profit % */}
+                    <td className={`${textCls} font-mono`}>{row[profitIdx] ?? '—'}</td>
+
+                    {/* BFA Bet ($) */}
+                    <td className={`${cellBase} font-mono text-[#e5e7eb]`}>
+                      {bfaBetIdx >= 0 && row[bfaBetIdx] ? `$${row[bfaBetIdx]}` : '—'}
+                    </td>
+
+                    {/* Poly Bet ($) */}
+                    <td className={`${cellBase} font-mono text-[#a78bfa]`}>
+                      {polyBetIdx >= 0 && row[polyBetIdx] ? `$${row[polyBetIdx]}` : '—'}
+                    </td>
+
+                    {/* Guaranteed P&L */}
+                    <td className={`${cellBase} font-mono`}>
+                      {pnlIdx >= 0 && row[pnlIdx] ? (() => {
+                        const v = parseFloat(row[pnlIdx]);
+                        return (
+                          <span className={v >= 0 ? 'text-[#22c55e]' : 'text-[#f87171]'}>
+                            {v >= 0 ? '+' : ''}${v.toFixed(2)}
+                          </span>
+                        );
+                      })() : '—'}
+                    </td>
+
+                    {/* Net Value */}
+                    <td className={`${cellBase} font-mono`}>
+                      {netValIdx >= 0 && row[netValIdx] ? (() => {
+                        const v = parseFloat(row[netValIdx]);
+                        return v >= 0 ? (
+                          <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-[rgba(34,197,94,0.15)] text-[#22c55e]">
+                            +${v.toFixed(2)}
+                          </span>
+                        ) : (
+                          <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-[rgba(239,68,68,0.12)] text-[#f87171]">
+                            ${v.toFixed(2)}
+                          </span>
+                        );
+                      })() : '—'}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
     </>
   );
 }
@@ -419,6 +706,7 @@ export default async function Results({
 }) {
   const { tab } = await searchParams;
   const isPredMarket = tab === 'predmarket';
+  const isBetFast = tab === 'betfast';
 
   return (
     <ResultsClient>
@@ -439,7 +727,7 @@ export default async function Results({
             </Suspense>
 
             {/* Tab content */}
-            {isPredMarket ? <PredMarketContent /> : <SportsbookContent />}
+            {isBetFast ? <BetFastContent /> : isPredMarket ? <PredMarketContent /> : <SportsbookContent />}
 
           </div>
         </div>

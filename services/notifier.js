@@ -1,0 +1,188 @@
+/**
+ * BFA ↔ Polymarket Arb Notifier
+ *
+ * Standalone service that:
+ *   1. Runs an Express health server (for Render + uptime pings)
+ *   2. Scans BFA↔Polymarket for arb on a jittered 4–8 min interval
+ *   3. Emails via Resend when cost ≤ 1.000
+ *   4. Deduplicates so you don't get spammed for the same game
+ *
+ * Env vars required:
+ *   PREDEXON_API_KEY, RESEND_API_KEY, NOTIFICATION_EMAIL
+ *
+ * Usage:  node services/notifier.js
+ */
+
+require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
+const http = require('http');
+const { Resend } = require('resend');
+const { runScan } = require('../scripts/bfagaming/scan');
+
+// ── Config ────────────────────────────────────────────────────────────────────
+
+const PORT              = process.env.PORT || 3001;
+const RESEND_API_KEY    = process.env.RESEND_API_KEY;
+const NOTIFICATION_EMAIL = process.env.NOTIFICATION_EMAIL;
+const ARB_THRESHOLD     = 1.000; // cost must be <= this to trigger email
+const MIN_INTERVAL_MS   = 4 * 60 * 1000;  // 4 minutes
+const MAX_INTERVAL_MS   = 8 * 60 * 1000;  // 8 minutes
+
+if (!RESEND_API_KEY) { console.error('RESEND_API_KEY not set'); process.exit(1); }
+if (!NOTIFICATION_EMAIL) { console.error('NOTIFICATION_EMAIL not set'); process.exit(1); }
+
+const resend = new Resend(RESEND_API_KEY);
+
+// ── Dedup ─────────────────────────────────────────────────────────────────────
+// Key: "awayTeam|homeTeam|strategy" → timestamp of last notification
+// Clears entries older than 12 hours so games can re-alert across days.
+
+const notified = new Map();
+const DEDUP_TTL_MS = 12 * 60 * 60 * 1000;
+
+function dedupKey(result) {
+  return `${result.awayTeam}|${result.homeTeam}|${result.strategy}`;
+}
+
+function alreadyNotified(result) {
+  const key = dedupKey(result);
+  const last = notified.get(key);
+  if (!last) return false;
+  if (Date.now() - last > DEDUP_TTL_MS) {
+    notified.delete(key);
+    return false;
+  }
+  return true;
+}
+
+function markNotified(result) {
+  notified.set(dedupKey(result), Date.now());
+}
+
+function pruneDedup() {
+  const now = Date.now();
+  for (const [key, ts] of notified) {
+    if (now - ts > DEDUP_TTL_MS) notified.delete(key);
+  }
+}
+
+// ── Email ─────────────────────────────────────────────────────────────────────
+
+async function sendArbEmail(arbs) {
+  const lines = arbs.map((a) => {
+    const profitStr = a.profitPct.toFixed(2);
+    const costStr = a.bestCost.toFixed(4);
+    return [
+      `${a.sport}: ${a.awayTeam} vs ${a.homeTeam}`,
+      `  Strategy:  ${a.strategy}`,
+      `  Cost:      ${costStr}`,
+      `  Profit:    ${profitStr}%`,
+      `  BFA bet:   $${a.bfaBet.toFixed(2)}`,
+      `  Poly bet:  $${a.polyBet.toFixed(2)}`,
+      `  P&L:       $${a.guaranteedPnl.toFixed(2)}`,
+      `  Net value: $${a.netValue.toFixed(2)}`,
+    ].join('\n');
+  });
+
+  const count = arbs.length;
+  const subject = `Arb Detected – ${count} opportunit${count === 1 ? 'y' : 'ies'} found`;
+
+  const body = [
+    `${count} arb opportunit${count === 1 ? 'y' : 'ies'} (cost ≤ ${ARB_THRESHOLD.toFixed(3)}):`,
+    '',
+    ...lines.join('\n\n───────────────────────────\n\n').split('\n'),
+    '',
+    `Scanned at ${new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' })} PT`,
+  ].join('\n');
+
+  try {
+    const { error } = await resend.emails.send({
+      from: 'polyArb <onboarding@resend.dev>',
+      to: [NOTIFICATION_EMAIL],
+      subject,
+      text: body,
+    });
+    if (error) {
+      console.error('Resend error:', error);
+    } else {
+      console.log(`  ✉ Email sent: ${subject}`);
+    }
+  } catch (err) {
+    console.error('Email send failed:', err.message);
+  }
+}
+
+// ── Scan loop ─────────────────────────────────────────────────────────────────
+
+let scanning = false;
+let lastScanTime = null;
+let lastScanArbs = 0;
+
+async function tick() {
+  if (scanning) {
+    console.log('Scan still running, skipping this tick.');
+    scheduleNext();
+    return;
+  }
+
+  scanning = true;
+  const start = Date.now();
+  console.log(`\n${'─'.repeat(50)}`);
+  console.log(`Scan starting at ${new Date().toLocaleString()}`);
+
+  try {
+    const results = await runScan();
+    const arbs = results.filter((r) => r.hasArb && r.bestCost <= ARB_THRESHOLD);
+
+    // Filter out already-notified arbs
+    const newArbs = arbs.filter((a) => !alreadyNotified(a));
+
+    console.log(`Scan done in ${((Date.now() - start) / 1000).toFixed(1)}s — ${results.length} games, ${arbs.length} arbs, ${newArbs.length} new`);
+
+    if (newArbs.length > 0) {
+      await sendArbEmail(newArbs);
+      newArbs.forEach(markNotified);
+    }
+
+    lastScanTime = new Date().toISOString();
+    lastScanArbs = arbs.length;
+    pruneDedup();
+  } catch (err) {
+    console.error('Scan error:', err.message);
+  } finally {
+    scanning = false;
+    scheduleNext();
+  }
+}
+
+function scheduleNext() {
+  const jitter = MIN_INTERVAL_MS + Math.random() * (MAX_INTERVAL_MS - MIN_INTERVAL_MS);
+  const mins = (jitter / 60000).toFixed(1);
+  console.log(`Next scan in ${mins} min`);
+  setTimeout(tick, jitter);
+}
+
+// ── Health server ─────────────────────────────────────────────────────────────
+
+const server = http.createServer((req, res) => {
+  if (req.url === '/health' || req.url === '/') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      status: 'ok',
+      scanning,
+      lastScanTime,
+      lastScanArbs,
+      notifiedCount: notified.size,
+    }));
+  } else {
+    res.writeHead(404);
+    res.end('not found');
+  }
+});
+
+server.listen(PORT, () => {
+  console.log(`Notifier health server on :${PORT}`);
+  console.log(`Threshold: cost ≤ ${ARB_THRESHOLD.toFixed(3)}`);
+  console.log(`Email: ${NOTIFICATION_EMAIL.replace(/(.{3}).*(@.*)/, '$1***$2')}`);
+  console.log('Starting first scan...\n');
+  tick();
+});

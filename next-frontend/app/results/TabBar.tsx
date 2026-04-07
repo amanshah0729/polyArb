@@ -4,6 +4,7 @@ import { useRouter, useSearchParams } from 'next/navigation';
 const TABS = [
   { key: 'sportsbook', label: 'Sportsbook Arb' },
   { key: 'predmarket', label: 'Pred Market Arb' },
+  { key: 'betfast', label: 'BetFast Arb' },
 ];
 
 export default function TabBar() {

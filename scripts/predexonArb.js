@@ -102,6 +102,7 @@ async function getPolyPrices(conditionId) {
   const data = await get('/polymarket/markets', { condition_id: conditionId });
   const market = data.markets?.[0];
   if (!market?.outcomes) return null;
+  if (!market.volume || market.volume === 0) return null;
 
   const yes = market.outcomes.find((o) => o.label === 'Yes');
   const no  = market.outcomes.find((o) => o.label === 'No');
