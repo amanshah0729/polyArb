@@ -39,7 +39,7 @@ async function main() {
     'BFAGaming Home Odds', 'BFAGaming Home Implied (%)',
     'Polymarket Away Implied (%)', 'Polymarket Home Implied (%)',
     'Profit %', 'Best Option Cost',
-    'BFA Bet ($)', 'Poly Bet ($)', 'Guaranteed P&L ($)', 'Net Value ($)',
+    'BFA Bet ($)', 'Poly Bet ($)', 'Guaranteed P&L ($)', 'Net Value ($)', 'Volume ($)',
   ].join(',');
 
   const csvRows = allResults.map((r) => [
@@ -65,6 +65,7 @@ async function main() {
     r.polyBet.toFixed(2),
     r.guaranteedPnl.toFixed(2),
     r.netValue.toFixed(2),
+    Math.round(r.volumeUsd ?? 0),
   ].join(','));
 
   const today = new Date().toISOString().split('T')[0];

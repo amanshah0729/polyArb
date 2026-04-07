@@ -27,175 +27,273 @@ function EmptyState({ message }: { message: string }) {
 function SportsbookContent() {
   const projectRoot = path.resolve(process.cwd(), '..');
   const dir = path.join(projectRoot, 'outputs', 'final_arb');
-  let files: string[] = [];
-  let lastPulledTimestamp: Date | undefined;
+  let lastPulledTimestamp: Date | null = null;
+
+  let rows: string[][] = [];
+  let headers: string[] = [];
+  let emptyMessage: string | null = null;
 
   try {
-    const today = new Date().toISOString().split('T')[0];
-    const allFiles = fs.readdirSync(dir).filter((f: string) => f.startsWith('arb_') && f.endsWith('.csv'));
-    files = allFiles.filter((f: string) => f.includes(today)).sort();
+    const allFiles = fs.readdirSync(dir)
+      .filter((f: string) => f.startsWith('arb_') && f.endsWith('.csv'))
+      .sort()
+      .reverse();
 
-    if (files.length === 0) {
-      const sportFiles: { [key: string]: string } = {};
-      allFiles.forEach((file: string) => {
-        const match = file.match(/arb_(nba|nfl|nhl)_(\d{4}-\d{2}-\d{2})\.csv/);
-        if (match) {
-          const sport = match[1];
-          const date = match[2];
-          if (!sportFiles[sport] || date > sportFiles[sport].split('_')[2].replace('.csv', '')) {
-            sportFiles[sport] = file;
+    // Prefer arb_all_ files (new unified format), fall back to old per-sport files
+    const unified = allFiles.find((f: string) => f.startsWith('arb_all_'));
+    const targetFile = unified ?? allFiles[0];
+
+    if (!targetFile) {
+      emptyMessage = "No sportsbook results found. Click 'Recalculate Arb' to run the scanner.";
+    } else {
+      const stats = fs.statSync(path.join(dir, targetFile));
+      lastPulledTimestamp = stats.mtime;
+
+      const content = fs.readFileSync(path.join(dir, targetFile), 'utf-8');
+      const lines = content.split('\n').filter((l: string) => l.trim());
+
+      if (lines.length < 2) {
+        emptyMessage = "No games found. Try running the scanner.";
+      } else {
+        headers = lines[0].split(',').map((h: string) => cleanCell(h));
+
+        for (let i = 1; i < lines.length; i++) {
+          const cells: string[] = [];
+          let cur = '';
+          let inQuote = false;
+          for (const ch of lines[i]) {
+            if (ch === '"') { inQuote = !inQuote; }
+            else if (ch === ',' && !inQuote) { cells.push(cur); cur = ''; }
+            else cur += ch;
           }
+          cells.push(cur);
+          if (cells.length >= headers.length) rows.push(cells.map((c: string) => c.replace(/"/g, '').trim()));
         }
-      });
-      files = Object.values(sportFiles).sort();
-    }
 
-    if (files.length > 0) {
-      let mostRecentTime = 0;
-      files.forEach((file: string) => {
-        const stats = fs.statSync(path.join(dir, file));
-        if (stats.mtime.getTime() > mostRecentTime) {
-          mostRecentTime = stats.mtime.getTime();
-          lastPulledTimestamp = stats.mtime;
-        }
-      });
+        if (rows.length === 0) emptyMessage = "No games found. Try running the scanner.";
+      }
     }
   } catch {
-    return <EmptyState message="Error reading sportsbook results directory." />;
+    emptyMessage = "Error reading sportsbook results directory.";
   }
 
-  if (files.length === 0) return <EmptyState message="No sportsbook results found. Click Recalculate Arb to run the scanner." />;
+  const idx = (name: string) => headers.indexOf(name);
+  const dateIdx          = idx('Date');
+  const timeIdx          = idx('Time');
+  const sportIdx         = idx('Sport');
+  const marketTypeIdx    = idx('Market Type');
+  const lineIdx          = idx('Line');
+  const awayIdx          = idx('Away Team');
+  const homeIdx          = idx('Home Team');
+  const arbIdx           = idx('Arb Opportunity');
+  const strategyIdx      = idx('Strategy');
+  const sbAwayBookIdx    = idx('Best Bookmaker Away');
+  const sbAwayOddsIdx    = idx('SB Away Odds');
+  const sbAwayImpIdx     = idx('SB Away Implied (%)');
+  const sbHomeBookIdx    = idx('Best Bookmaker Home');
+  const sbHomeOddsIdx    = idx('SB Home Odds');
+  const sbHomeImpIdx     = idx('SB Home Implied (%)');
+  const polyAwayIdx      = idx('Polymarket Away Implied (%)');
+  const polyHomeIdx      = idx('Polymarket Home Implied (%)');
+  const profitIdx        = idx('Profit %');
+  const costIdx          = idx('Best Option Cost');
+  const volumeIdx        = idx('Volume ($)');
 
-  const allRows: Array<{ row: string[]; sport: string }> = [];
-  let originalHeaders: string[] = [];
+  const sportBadgeClass = (sport: string) => {
+    if (sport === 'NBA') return 'bg-[rgba(96,165,250,0.2)] text-[#60a5fa]';
+    if (sport === 'NHL') return 'bg-[rgba(20,184,166,0.2)] text-[#2dd4bf]';
+    if (sport === 'NFL') return 'bg-[rgba(251,146,60,0.2)] text-[#fb923c]';
+    if (sport === 'MLB') return 'bg-[rgba(239,68,68,0.2)] text-[#f87171]';
+    if (sport === 'UFC') return 'bg-[rgba(168,85,247,0.2)] text-[#a855f7]';
+    if (sport === 'EPL') return 'bg-[rgba(52,211,153,0.2)] text-[#34d399]';
+    if (sport === 'MLS') return 'bg-[rgba(251,191,36,0.2)] text-[#fbbf24]';
+    if (sport === 'BOX') return 'bg-[rgba(244,114,182,0.2)] text-[#f472b6]';
+    return 'bg-[rgba(156,163,175,0.2)] text-[#9ca3af]';
+  };
 
-  files.forEach((file: string) => {
-    try {
-      const sportMatch = file.match(/arb_(nba|nfl|nhl)_/);
-      const sport = sportMatch ? sportMatch[1].toUpperCase() : 'UNKNOWN';
-      const content = fs.readFileSync(path.join(dir, file), 'utf-8');
-      const lines = content.split('\n').filter((l: string) => l.trim());
-      if (lines.length > 0) {
-        if (originalHeaders.length === 0) originalHeaders = lines[0].split(',');
-        allRows.push(...lines.slice(1).map((line: string) => ({ row: line.split(','), sport })));
-      }
-    } catch { /* skip bad file */ }
-  });
+  function getSideLabels(row: string[]) {
+    const marketType = row[marketTypeIdx] ?? 'moneyline';
+    const line = row[lineIdx] ?? '';
+    const away = row[awayIdx] ?? '';
+    const home = row[homeIdx] ?? '';
 
-  if (allRows.length === 0) return <EmptyState message="No arbitrage data found." />;
+    if (marketType === 'total') {
+      return { side1: `Over ${line}`, side2: `Under ${line}` };
+    }
+    if (marketType === 'spread' && line) {
+      const num = parseFloat(line);
+      const oppLine = num > 0 ? `-${Math.abs(num)}` : `+${Math.abs(num)}`;
+      return { side1: `${away} ${line}`, side2: `${home} ${oppLine}` };
+    }
+    return { side1: away, side2: home };
+  }
 
-  const idx = (name: string) => originalHeaders.findIndex(h => h.replace(/"/g, '').trim() === name);
-  const bestOptionCostIdx   = idx('Best Option Cost');
-  const awayTeamIdx         = idx('Away Team');
-  const homeTeamIdx         = idx('Home Team');
-  const dateIdx             = idx('Date');
-  const timeIdx             = idx('Time');
-  const statusIdx           = idx('Status');
-  const arbOppIdx           = idx('Arb Opportunity');
-  const lowestAwayBookIdx   = idx('Lowest Away Bookmaker');
-  const lowestAwayImpliedIdx = idx('Lowest Away Implied Prob (%)');
-  const lowestHomeBookIdx   = idx('Lowest Home Bookmaker');
-  const lowestHomeImpliedIdx = idx('Lowest Home Implied Prob (%)');
-  const polyAwayImpliedIdx  = idx('Polymarket Away Implied Prob (%)');
-  const polyHomeImpliedIdx  = idx('Polymarket Home Implied Prob (%)');
-  const profitIdx           = idx('Profit %');
+  function getMarketLabel(row: string[]) {
+    const marketType = row[marketTypeIdx] ?? 'moneyline';
+    const line = row[lineIdx] ?? '';
+    if (marketType === 'total') return `Total O/U ${line}`;
+    if (marketType === 'spread') return `Spread ${line}`;
+    return 'Moneyline';
+  }
 
-  const headers = [
-    'Best Option Cost', 'Date', 'Time', 'Game', 'Status', 'Arb Opportunity',
-    'Lowest Away Bookmaker', 'Lowest Away Implied Prob (%)',
-    'Lowest Home Bookmaker', 'Lowest Home Implied Prob (%)',
-    'Polymarket Away Implied Prob (%)', 'Polymarket Home Implied Prob (%)', 'Profit %',
-  ];
+  function renderStrategy(raw: string) {
+    const parts = raw.split(' + ');
+    if (parts.length !== 2) return <span className="text-[#9ca3af] text-sm">{raw}</span>;
+    return (
+      <div className="flex flex-col gap-0.5">
+        {parts.map((part, i) => {
+          const atIdx = part.lastIndexOf('@');
+          if (atIdx === -1) return <span key={i} className="text-[#9ca3af] text-sm">{part}</span>;
+          const team = part.slice(0, atIdx);
+          const platform = part.slice(atIdx + 1);
+          return (
+            <span key={i} className="text-sm">
+              <span className="font-semibold text-[#e5e7eb]">{team}</span>
+              <span className="text-[#6b7280] text-xs"> @{platform}</span>
+            </span>
+          );
+        })}
+      </div>
+    );
+  }
 
-  const transformedRows = allRows.map(({ row, sport }) => ({
-    data: [
-      bestOptionCostIdx >= 0 ? cleanCell(row[bestOptionCostIdx]) : '',
-      dateIdx >= 0 ? cleanCell(row[dateIdx]) : '',
-      timeIdx >= 0 ? cleanCell(row[timeIdx]).replace(/:00 /, ' ') : '',
-      awayTeamIdx >= 0 && homeTeamIdx >= 0 ? `${cleanCell(row[awayTeamIdx])} (A) @ ${cleanCell(row[homeTeamIdx])} (H)` : '',
-      statusIdx >= 0 ? cleanCell(row[statusIdx]) : '',
-      arbOppIdx >= 0 ? cleanCell(row[arbOppIdx]) : '',
-      lowestAwayBookIdx >= 0 ? cleanCell(row[lowestAwayBookIdx]) : '',
-      lowestAwayImpliedIdx >= 0 ? cleanCell(row[lowestAwayImpliedIdx]) : '',
-      lowestHomeBookIdx >= 0 ? cleanCell(row[lowestHomeBookIdx]) : '',
-      lowestHomeImpliedIdx >= 0 ? cleanCell(row[lowestHomeImpliedIdx]) : '',
-      polyAwayImpliedIdx >= 0 ? cleanCell(row[polyAwayImpliedIdx]) : '',
-      polyHomeImpliedIdx >= 0 ? cleanCell(row[polyHomeImpliedIdx]) : '',
-      profitIdx >= 0 ? cleanCell(row[profitIdx]) : '',
-    ],
-    sport,
-  }));
-
-  transformedRows.sort((a, b) => {
-    const aYes = a.data[5] === 'YES', bYes = b.data[5] === 'YES';
-    return aYes === bYes ? 0 : aYes ? -1 : 1;
-  });
+  function formatOdds(odds: string) {
+    const v = parseFloat(odds);
+    if (isNaN(v)) return odds;
+    return v > 0 ? `+${odds}` : odds;
+  }
 
   return (
     <>
       <div className="bg-[#1f2937] px-8 py-5 flex items-center justify-between border-b border-[rgba(255,255,255,0.08)]">
         <div>
-          <p className="text-[#9ca3af] text-sm font-medium">NFL · NHL · NBA</p>
+          <p className="text-[#9ca3af] text-sm font-medium">All Sportsbooks ↔ Polymarket · all sports · all markets</p>
           {lastPulledTimestamp && (
             <p className="text-[#9ca3af] text-xs mt-1">Last pulled: {lastPulledTimestamp.toLocaleString()}</p>
           )}
         </div>
         <RerunButton />
       </div>
-      <div className="overflow-x-auto">
-        <table className="w-full border-collapse min-w-full" style={{ tableLayout: 'auto' }}>
-          <thead className="sticky top-0 z-10">
-            <tr className="bg-[#1f2937] border-b border-[rgba(255,255,255,0.08)]">
-              {headers.map((h, i) => (
-                <th key={i} className="px-[18px] py-[14px] text-left text-[0.9rem] font-medium text-[#e5e7eb] uppercase tracking-wider whitespace-nowrap">
-                  {h.replace('Arb Opportunity', 'Arbitrage Opportunity')}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {transformedRows.map(({ data: row, sport }, i) => {
-              const isOpportunity = row[5] === 'YES';
-              const lowestAway = parseFloat(row[7]) || 0;
-              const lowestHome = parseFloat(row[9]) || 0;
-              const polyAway   = parseFloat(row[10]) || 0;
-              const polyHome   = parseFloat(row[11]) || 0;
-              const highlightCols = lowestAway + polyHome < polyAway + lowestHome ? [7, 11] : [10, 9];
 
-              return (
-                <tr key={i} className={`border-b border-[rgba(255,255,255,0.08)] transition-colors duration-150 ${
-                  isOpportunity ? 'bg-[rgba(34,197,94,0.1)] hover:bg-[rgba(56,189,248,0.08)]'
-                    : i % 2 === 0 ? 'bg-[#111827] hover:bg-[rgba(56,189,248,0.08)]'
-                    : 'bg-[rgba(255,255,255,0.02)] hover:bg-[rgba(56,189,248,0.08)]'
-                }`}>
-                  {row.map((cell, j) => {
-                    let cls = 'px-[18px] py-5 text-sm text-[#e5e7eb] whitespace-nowrap';
-                    if (isOpportunity) cls += ' font-semibold text-[#22c55e]';
-                    if (isOpportunity && highlightCols.includes(j)) cls += ' text-[#fbbf24]';
+      {emptyMessage ? (
+        <EmptyState message={emptyMessage} />
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 p-6">
+          {rows.map((row, i) => {
+            const isArb = (row[arbIdx] ?? '') === 'YES';
+            const sport = row[sportIdx] ?? '';
+            const { side1, side2 } = getSideLabels(row);
+            const marketLabel = getMarketLabel(row);
+            const cost = row[costIdx] ?? '';
+            const profit = row[profitIdx] ?? '';
+            const sbAwayOdds = row[sbAwayOddsIdx] ?? '';
+            const sbAwayImp = row[sbAwayImpIdx] ?? '';
+            const sbHomeOdds = row[sbHomeOddsIdx] ?? '';
+            const sbHomeImp = row[sbHomeImpIdx] ?? '';
+            const sbAwayBook = row[sbAwayBookIdx] ?? '';
+            const sbHomeBook = row[sbHomeBookIdx] ?? '';
+            const polyAway = row[polyAwayIdx] ?? '';
+            const polyHome = row[polyHomeIdx] ?? '';
+            const volume = volumeIdx >= 0 ? row[volumeIdx] ?? '' : '';
 
-                    if (j === 3) {
-                      const parts = cell.split(' (A) @ ');
-                      if (parts.length === 2) {
-                        const away = parts[0], home = parts[1].replace(' (H)', '');
-                        return (
-                          <td key={j} className={cls}>
-                            <span className="text-[#60a5fa] font-semibold mr-2">[{sport}]</span>
-                            <span className="text-[#9ca3af]">{away}</span>
-                            <span className="text-[#6b7280] mx-2">(A) @</span>
-                            <span className="text-[#9ca3af]">{home}</span>
-                            <span className="text-[#6b7280] ml-1">(H)</span>
-                          </td>
-                        );
-                      }
-                    }
-                    return <td key={j} className={cls}>{cell}</td>;
-                  })}
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
+            return (
+              <div
+                key={i}
+                className={`rounded-xl border transition-colors duration-150 ${
+                  isArb
+                    ? 'border-[rgba(34,197,94,0.4)] bg-[rgba(34,197,94,0.06)]'
+                    : 'border-[rgba(255,255,255,0.08)] bg-[#111827]'
+                } ${isArb ? 'ring-1 ring-[rgba(34,197,94,0.2)]' : ''}`}
+              >
+                {/* Header: sport + date + cost */}
+                <div className="flex items-center justify-between px-4 pt-4 pb-2">
+                  <div className="flex items-center gap-2">
+                    <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${sportBadgeClass(sport)}`}>
+                      {sport}
+                    </span>
+                    <span className="text-[#6b7280] text-xs">
+                      {row[dateIdx] ?? ''} · {(row[timeIdx] ?? '').replace(/:00 /, ' ')}
+                    </span>
+                  </div>
+                  <span className={`font-mono text-xs ${isArb ? 'text-[#22c55e] font-semibold' : 'text-[#6b7280]'}`}>
+                    {cost}
+                  </span>
+                </div>
+
+                {/* Game title + market type */}
+                <div className="px-4 pb-3">
+                  <div className="text-[#e5e7eb] font-semibold text-base">
+                    {row[awayIdx] ?? ''} vs {row[homeIdx] ?? ''}
+                  </div>
+                  <div className="flex items-center gap-2 mt-1">
+                    <span className="px-2 py-0.5 rounded text-xs font-medium bg-[rgba(255,255,255,0.06)] text-[#9ca3af]">
+                      {marketLabel}
+                    </span>
+                    {volume && (
+                      <span className="text-[#6b7280] text-xs">
+                        vol: ${Number(volume).toLocaleString()}
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                {/* Two side-by-side odds boxes */}
+                <div className="grid grid-cols-2 gap-2 px-4 pb-3">
+                  {/* Side 1 (away / over) */}
+                  <div className="rounded-lg bg-[rgba(255,255,255,0.04)] p-3">
+                    <div className="text-[#e5e7eb] font-semibold text-sm mb-1.5">{side1}</div>
+                    <div className="space-y-1">
+                      <div className="flex items-baseline gap-1 flex-wrap">
+                        <span className="text-[#6b7280] text-xs">{sbAwayBook}</span>
+                        <span className={`font-mono text-sm ${parseFloat(sbAwayOdds) > 0 ? 'text-[#22c55e]' : 'text-[#f87171]'}`}>
+                          {formatOdds(sbAwayOdds)}
+                        </span>
+                        <span className="text-[#6b7280] text-xs">({sbAwayImp}%)</span>
+                      </div>
+                      <div className="flex items-baseline gap-1">
+                        <span className="text-[#6b7280] text-xs">Poly</span>
+                        <span className="font-mono text-sm text-[#a78bfa]">{polyAway}%</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Side 2 (home / under) */}
+                  <div className="rounded-lg bg-[rgba(255,255,255,0.04)] p-3">
+                    <div className="text-[#e5e7eb] font-semibold text-sm mb-1.5">{side2}</div>
+                    <div className="space-y-1">
+                      <div className="flex items-baseline gap-1 flex-wrap">
+                        <span className="text-[#6b7280] text-xs">{sbHomeBook}</span>
+                        <span className={`font-mono text-sm ${parseFloat(sbHomeOdds) > 0 ? 'text-[#22c55e]' : 'text-[#f87171]'}`}>
+                          {formatOdds(sbHomeOdds)}
+                        </span>
+                        <span className="text-[#6b7280] text-xs">({sbHomeImp}%)</span>
+                      </div>
+                      <div className="flex items-baseline gap-1">
+                        <span className="text-[#6b7280] text-xs">Poly</span>
+                        <span className="font-mono text-sm text-[#a78bfa]">{polyHome}%</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Strategy */}
+                {strategyIdx >= 0 && row[strategyIdx] && (
+                  <div className="px-4 pb-2">
+                    {renderStrategy(row[strategyIdx])}
+                  </div>
+                )}
+
+                {/* Bottom stats row */}
+                <div className="flex items-center justify-between px-4 py-3 border-t border-[rgba(255,255,255,0.06)] text-xs">
+                  <span className={`font-mono ${isArb ? 'text-[#22c55e] font-semibold' : 'text-[#9ca3af]'}`}>
+                    {profit ? `${profit}%` : ''}
+                  </span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </>
   );
 }
@@ -420,11 +518,61 @@ function PredMarketContent() {
 
 // ── BetFast tab ───────────────────────────────────────────────────────────────
 
-function BetFastContent() {
+async function fetchRemoteResults(): Promise<{ lastScanTime: string | null; results: any[] } | null> {
+  const url = process.env.NOTIFIER_URL;
+  if (!url) return null;
+  try {
+    const res = await fetch(`${url}/results`, { cache: 'no-store', signal: AbortSignal.timeout(5000) });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+function resultsToRows(results: any[]): { headers: string[]; rows: string[][] } {
+  const headers = [
+    'Date', 'Time', 'Sport', 'Market Type', 'Line',
+    'Away Team', 'Home Team', 'Status',
+    'Arb Opportunity', 'Strategy',
+    'BFAGaming Away Odds', 'BFAGaming Away Implied (%)',
+    'BFAGaming Home Odds', 'BFAGaming Home Implied (%)',
+    'Polymarket Away Implied (%)', 'Polymarket Home Implied (%)',
+    'Profit %', 'Best Option Cost',
+    'BFA Bet ($)', 'Poly Bet ($)', 'Guaranteed P&L ($)', 'Net Value ($)', 'Volume ($)',
+  ];
+  const rows = results.map((r: any) => [
+    r.date ?? '',
+    r.time ?? '',
+    r.sport ?? '',
+    r.marketType ?? '',
+    r.line ?? '',
+    r.awayTeam ?? '',
+    r.homeTeam ?? '',
+    r.status ?? '',
+    r.hasArb ? 'YES' : 'NO',
+    r.strategy ?? '',
+    String(r.bfaAwayOdds ?? ''),
+    ((r.bfaAwayImplied ?? 0) * 100).toFixed(2),
+    String(r.bfaHomeOdds ?? ''),
+    ((r.bfaHomeImplied ?? 0) * 100).toFixed(2),
+    ((r.polyAwayImplied ?? 0) * 100).toFixed(2),
+    ((r.polyHomeImplied ?? 0) * 100).toFixed(2),
+    (r.profitPct ?? 0).toFixed(2),
+    (r.bestCost ?? 0).toFixed(4),
+    (r.bfaBet ?? 0).toFixed(2),
+    (r.polyBet ?? 0).toFixed(2),
+    (r.guaranteedPnl ?? 0).toFixed(2),
+    (r.netValue ?? 0).toFixed(2),
+    String(Math.round(r.volumeUsd ?? 0)),
+  ]);
+  return { headers, rows };
+}
+
+function readLocalCSV(): { headers: string[]; rows: string[][]; lastPulledTimestamp: Date | null; emptyMessage: string | null } {
   const projectRoot = path.resolve(process.cwd(), '..');
   const dir = path.join(projectRoot, 'outputs', 'bfagaming');
   let lastPulledTimestamp: Date | null = null;
-
   let rows: string[][] = [];
   let headers: string[] = [];
   let emptyMessage: string | null = null;
@@ -470,13 +618,38 @@ function BetFastContent() {
     emptyMessage = "Error reading BetFast results directory.";
   }
 
+  return { headers, rows, lastPulledTimestamp, emptyMessage };
+}
+
+async function BetFastContent() {
+  let rows: string[][] = [];
+  let headers: string[] = [];
+  let lastPulledTimestamp: Date | null = null;
+  let emptyMessage: string | null = null;
+
+  // Try remote notifier first, fall back to local CSV
+  const remote = await fetchRemoteResults();
+  if (remote && remote.results && remote.results.length > 0) {
+    const parsed = resultsToRows(remote.results);
+    headers = parsed.headers;
+    rows = parsed.rows;
+    lastPulledTimestamp = remote.lastScanTime ? new Date(remote.lastScanTime) : null;
+  } else {
+    const local = readLocalCSV();
+    headers = local.headers;
+    rows = local.rows;
+    lastPulledTimestamp = local.lastPulledTimestamp;
+    emptyMessage = local.emptyMessage;
+  }
+
   const idx = (name: string) => headers.indexOf(name);
   const dateIdx         = idx('Date');
   const timeIdx         = idx('Time');
   const sportIdx        = idx('Sport');
+  const marketTypeIdx   = idx('Market Type');
+  const lineIdx         = idx('Line');
   const awayIdx         = idx('Away Team');
   const homeIdx         = idx('Home Team');
-  const statusIdx       = idx('Status');
   const arbIdx          = idx('Arb Opportunity');
   const strategyIdx     = idx('Strategy');
   const bfaAwayOddsIdx  = idx('BFAGaming Away Odds');
@@ -491,26 +664,55 @@ function BetFastContent() {
   const polyBetIdx      = idx('Poly Bet ($)');
   const pnlIdx          = idx('Guaranteed P&L ($)');
   const netValIdx       = idx('Net Value ($)');
+  const volumeIdx       = idx('Volume ($)');
 
   const sportBadgeClass = (sport: string) => {
     if (sport === 'NBA') return 'bg-[rgba(96,165,250,0.2)] text-[#60a5fa]';
     if (sport === 'NHL') return 'bg-[rgba(20,184,166,0.2)] text-[#2dd4bf]';
-    return 'bg-[rgba(251,146,60,0.2)] text-[#fb923c]'; // NFL
+    if (sport === 'NFL') return 'bg-[rgba(251,146,60,0.2)] text-[#fb923c]';
+    if (sport === 'MLB') return 'bg-[rgba(239,68,68,0.2)] text-[#f87171]';
+    if (sport === 'UFC') return 'bg-[rgba(168,85,247,0.2)] text-[#a855f7]';
+    return 'bg-[rgba(156,163,175,0.2)] text-[#9ca3af]';
   };
+
+  function getSideLabels(row: string[]) {
+    const marketType = row[marketTypeIdx] ?? 'moneyline';
+    const line = row[lineIdx] ?? '';
+    const away = row[awayIdx] ?? '';
+    const home = row[homeIdx] ?? '';
+
+    if (marketType === 'total') {
+      return { side1: `Over ${line}`, side2: `Under ${line}` };
+    }
+    if (marketType === 'spread' && line) {
+      const num = parseFloat(line);
+      const oppLine = num > 0 ? `-${Math.abs(num)}` : `+${Math.abs(num)}`;
+      return { side1: `${away} ${line}`, side2: `${home} ${oppLine}` };
+    }
+    return { side1: away, side2: home };
+  }
+
+  function getMarketLabel(row: string[]) {
+    const marketType = row[marketTypeIdx] ?? 'moneyline';
+    const line = row[lineIdx] ?? '';
+    if (marketType === 'total') return `Total O/U ${line}`;
+    if (marketType === 'spread') return `Spread ${line}`;
+    return 'Moneyline';
+  }
 
   /** "Bulls@BFA + Clippers@Poly" → two styled spans */
   function renderStrategy(raw: string) {
     const parts = raw.split(' + ');
-    if (parts.length !== 2) return <span className="text-[#9ca3af]">{raw}</span>;
+    if (parts.length !== 2) return <span className="text-[#9ca3af] text-sm">{raw}</span>;
     return (
       <div className="flex flex-col gap-0.5">
         {parts.map((part, i) => {
           const atIdx = part.lastIndexOf('@');
-          if (atIdx === -1) return <span key={i} className="text-[#9ca3af]">{part}</span>;
+          if (atIdx === -1) return <span key={i} className="text-[#9ca3af] text-sm">{part}</span>;
           const team = part.slice(0, atIdx);
           const platform = part.slice(atIdx + 1);
           return (
-            <span key={i} className="text-[#9ca3af]">
+            <span key={i} className="text-sm">
               <span className="font-semibold text-[#e5e7eb]">{team}</span>
               <span className="text-[#6b7280] text-xs"> @{platform}</span>
             </span>
@@ -520,15 +722,11 @@ function BetFastContent() {
     );
   }
 
-  const tableHeaders = [
-    'Best Option Cost', 'Date / Time', 'Sport', 'Game', 'Status', 'Arb Opportunity',
-    'Strategy',
-    'BFA Away', 'BFA Home',
-    'Poly Away %', 'Poly Home %', 'Profit %',
-    'BFA Bet ($)', 'Poly Bet ($)', 'Guar. P&L', 'Net Value',
-  ];
-
-  const cellBase = 'px-[18px] py-5 text-sm text-[#e5e7eb] whitespace-nowrap';
+  function formatOdds(odds: string) {
+    const v = parseFloat(odds);
+    if (isNaN(v)) return odds;
+    return v > 0 ? `+${odds}` : odds;
+  }
 
   return (
     <>
@@ -549,148 +747,154 @@ function BetFastContent() {
       {emptyMessage ? (
         <EmptyState message={emptyMessage} />
       ) : (
-        <div className="overflow-x-auto">
-          <table className="w-full border-collapse min-w-full" style={{ tableLayout: 'auto' }}>
-            <thead className="sticky top-0 z-10">
-              <tr className="bg-[#1f2937] border-b border-[rgba(255,255,255,0.08)]">
-                {tableHeaders.map((h, i) => (
-                  <th key={i} className="px-[18px] py-[14px] text-left text-[0.9rem] font-medium text-[#e5e7eb] uppercase tracking-wider whitespace-nowrap">
-                    {h}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((row, i) => {
-                const isOpportunity = (row[arbIdx] ?? '') === 'YES';
-                const sport = row[sportIdx] ?? '';
-                const away = row[awayIdx] ?? '';
-                const home = row[homeIdx] ?? '';
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 p-6">
+          {rows.map((row, i) => {
+            const isArb = (row[arbIdx] ?? '') === 'YES';
+            const sport = row[sportIdx] ?? '';
+            const { side1, side2 } = getSideLabels(row);
+            const marketLabel = getMarketLabel(row);
+            const cost = row[costIdx] ?? '';
+            const profit = row[profitIdx] ?? '';
+            const bfaAwayOdds = row[bfaAwayOddsIdx] ?? '';
+            const bfaAwayImp = row[bfaAwayImpIdx] ?? '';
+            const bfaHomeOdds = row[bfaHomeOddsIdx] ?? '';
+            const bfaHomeImp = row[bfaHomeImpIdx] ?? '';
+            const polyAway = row[polyAwayIdx] ?? '';
+            const polyHome = row[polyHomeIdx] ?? '';
+            const volume = volumeIdx >= 0 ? row[volumeIdx] ?? '' : '';
 
-                const rowCls = `border-b border-[rgba(255,255,255,0.08)] transition-colors duration-150 ${
-                  isOpportunity
-                    ? 'bg-[rgba(34,197,94,0.1)] hover:bg-[rgba(56,189,248,0.08)]'
-                    : i % 2 === 0
-                    ? 'bg-[#111827] hover:bg-[rgba(56,189,248,0.08)]'
-                    : 'bg-[rgba(255,255,255,0.02)] hover:bg-[rgba(56,189,248,0.08)]'
-                }`;
+            return (
+              <div
+                key={i}
+                className={`rounded-xl border transition-colors duration-150 ${
+                  isArb
+                    ? 'border-[rgba(34,197,94,0.4)] bg-[rgba(34,197,94,0.06)]'
+                    : 'border-[rgba(255,255,255,0.08)] bg-[#111827]'
+                } ${isArb ? 'ring-1 ring-[rgba(34,197,94,0.2)]' : ''}`}
+              >
+                {/* Header: sport + date + cost */}
+                <div className="flex items-center justify-between px-4 pt-4 pb-2">
+                  <div className="flex items-center gap-2">
+                    <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${sportBadgeClass(sport)}`}>
+                      {sport}
+                    </span>
+                    <span className="text-[#6b7280] text-xs">
+                      {row[dateIdx] ?? ''} · {(row[timeIdx] ?? '').replace(/:00 /, ' ')}
+                    </span>
+                  </div>
+                  <span className={`font-mono text-xs ${isArb ? 'text-[#22c55e] font-semibold' : 'text-[#6b7280]'}`}>
+                    {cost}
+                  </span>
+                </div>
 
-                const textCls = isOpportunity ? `${cellBase} font-semibold text-[#22c55e]` : cellBase;
-
-                return (
-                  <tr key={i} className={rowCls}>
-                    {/* Best Option Cost */}
-                    <td className={`${textCls} font-mono`}>{row[costIdx] ?? '—'}</td>
-
-                    {/* Date / Time */}
-                    <td className={cellBase}>
-                      <div className="text-[#e5e7eb]">{row[dateIdx] ?? ''}</div>
-                      <div className="text-[#6b7280] text-xs">{(row[timeIdx] ?? '').replace(/:00 /, ' ')}</div>
-                    </td>
-
-                    {/* Sport badge */}
-                    <td className={cellBase}>
-                      <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${sportBadgeClass(sport)}`}>
-                        {sport}
+                {/* Game title + market type */}
+                <div className="px-4 pb-3">
+                  <div className="text-[#e5e7eb] font-semibold text-base">
+                    {row[awayIdx] ?? ''} vs {row[homeIdx] ?? ''}
+                  </div>
+                  <div className="flex items-center gap-2 mt-1">
+                    <span className="px-2 py-0.5 rounded text-xs font-medium bg-[rgba(255,255,255,0.06)] text-[#9ca3af]">
+                      {marketLabel}
+                    </span>
+                    {volume && (
+                      <span className="text-[#6b7280] text-xs">
+                        vol: ${Number(volume).toLocaleString()}
                       </span>
-                    </td>
+                    )}
+                  </div>
+                </div>
 
-                    {/* Game */}
-                    <td className={cellBase}>
-                      <span className="text-[#9ca3af]">{away}</span>
-                      <span className="text-[#6b7280] mx-2">(A) @</span>
-                      <span className="text-[#9ca3af]">{home}</span>
-                      <span className="text-[#6b7280] ml-1">(H)</span>
-                    </td>
+                {/* Two side-by-side odds boxes */}
+                <div className="grid grid-cols-2 gap-2 px-4 pb-3">
+                  {/* Side 1 (away / over) */}
+                  <div className="rounded-lg bg-[rgba(255,255,255,0.04)] p-3">
+                    <div className="text-[#e5e7eb] font-semibold text-sm mb-1.5">{side1}</div>
+                    <div className="space-y-1">
+                      <div className="flex items-baseline gap-1">
+                        <span className="text-[#6b7280] text-xs w-8">BFA</span>
+                        <span className={`font-mono text-sm ${parseFloat(bfaAwayOdds) > 0 ? 'text-[#22c55e]' : 'text-[#f87171]'}`}>
+                          {formatOdds(bfaAwayOdds)}
+                        </span>
+                        <span className="text-[#6b7280] text-xs">({bfaAwayImp}%)</span>
+                      </div>
+                      <div className="flex items-baseline gap-1">
+                        <span className="text-[#6b7280] text-xs w-8">Poly</span>
+                        <span className="font-mono text-sm text-[#a78bfa]">{polyAway}%</span>
+                      </div>
+                    </div>
+                  </div>
 
-                    {/* Status */}
-                    <td className={cellBase}>{row[statusIdx] ?? ''}</td>
+                  {/* Side 2 (home / under) */}
+                  <div className="rounded-lg bg-[rgba(255,255,255,0.04)] p-3">
+                    <div className="text-[#e5e7eb] font-semibold text-sm mb-1.5">{side2}</div>
+                    <div className="space-y-1">
+                      <div className="flex items-baseline gap-1">
+                        <span className="text-[#6b7280] text-xs w-8">BFA</span>
+                        <span className={`font-mono text-sm ${parseFloat(bfaHomeOdds) > 0 ? 'text-[#22c55e]' : 'text-[#f87171]'}`}>
+                          {formatOdds(bfaHomeOdds)}
+                        </span>
+                        <span className="text-[#6b7280] text-xs">({bfaHomeImp}%)</span>
+                      </div>
+                      <div className="flex items-baseline gap-1">
+                        <span className="text-[#6b7280] text-xs w-8">Poly</span>
+                        <span className="font-mono text-sm text-[#a78bfa]">{polyHome}%</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
 
-                    {/* Arb Opportunity */}
-                    <td className={textCls}>{row[arbIdx] ?? ''}</td>
+                {/* Strategy */}
+                {strategyIdx >= 0 && row[strategyIdx] && (
+                  <div className="px-4 pb-2">
+                    {renderStrategy(row[strategyIdx])}
+                  </div>
+                )}
 
-                    {/* Strategy */}
-                    <td className={cellBase}>
-                      {strategyIdx >= 0 && row[strategyIdx]
-                        ? renderStrategy(row[strategyIdx])
-                        : <span className="text-[#6b7280]">—</span>}
-                    </td>
-
-                    {/* BFA Away: odds + implied combined */}
-                    <td className={`${cellBase} font-mono`}>
-                      {bfaAwayOddsIdx >= 0 && row[bfaAwayOddsIdx] ? (
-                        <div>
-                          <span className={parseFloat(row[bfaAwayOddsIdx]) > 0 ? 'text-[#22c55e]' : 'text-[#f87171]'}>
-                            {parseFloat(row[bfaAwayOddsIdx]) > 0 ? '+' : ''}{row[bfaAwayOddsIdx]}
-                          </span>
-                          <span className="text-[#6b7280] text-xs ml-1">({row[bfaAwayImpIdx]}%)</span>
-                        </div>
-                      ) : '—'}
-                    </td>
-
-                    {/* BFA Home: odds + implied combined */}
-                    <td className={`${cellBase} font-mono`}>
-                      {bfaHomeOddsIdx >= 0 && row[bfaHomeOddsIdx] ? (
-                        <div>
-                          <span className={parseFloat(row[bfaHomeOddsIdx]) > 0 ? 'text-[#22c55e]' : 'text-[#f87171]'}>
-                            {parseFloat(row[bfaHomeOddsIdx]) > 0 ? '+' : ''}{row[bfaHomeOddsIdx]}
-                          </span>
-                          <span className="text-[#6b7280] text-xs ml-1">({row[bfaHomeImpIdx]}%)</span>
-                        </div>
-                      ) : '—'}
-                    </td>
-
-                    {/* Poly Away */}
-                    <td className={`${cellBase} font-mono text-[#a78bfa]`}>{row[polyAwayIdx] ?? '—'}</td>
-
-                    {/* Poly Home */}
-                    <td className={`${cellBase} font-mono text-[#a78bfa]`}>{row[polyHomeIdx] ?? '—'}</td>
-
-                    {/* Profit % */}
-                    <td className={`${textCls} font-mono`}>{row[profitIdx] ?? '—'}</td>
-
-                    {/* BFA Bet ($) */}
-                    <td className={`${cellBase} font-mono text-[#e5e7eb]`}>
-                      {bfaBetIdx >= 0 && row[bfaBetIdx] ? `$${row[bfaBetIdx]}` : '—'}
-                    </td>
-
-                    {/* Poly Bet ($) */}
-                    <td className={`${cellBase} font-mono text-[#a78bfa]`}>
-                      {polyBetIdx >= 0 && row[polyBetIdx] ? `$${row[polyBetIdx]}` : '—'}
-                    </td>
-
-                    {/* Guaranteed P&L */}
-                    <td className={`${cellBase} font-mono`}>
-                      {pnlIdx >= 0 && row[pnlIdx] ? (() => {
-                        const v = parseFloat(row[pnlIdx]);
-                        return (
-                          <span className={v >= 0 ? 'text-[#22c55e]' : 'text-[#f87171]'}>
-                            {v >= 0 ? '+' : ''}${v.toFixed(2)}
-                          </span>
-                        );
-                      })() : '—'}
-                    </td>
-
-                    {/* Net Value */}
-                    <td className={`${cellBase} font-mono`}>
-                      {netValIdx >= 0 && row[netValIdx] ? (() => {
-                        const v = parseFloat(row[netValIdx]);
-                        return v >= 0 ? (
-                          <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-[rgba(34,197,94,0.15)] text-[#22c55e]">
-                            +${v.toFixed(2)}
-                          </span>
-                        ) : (
-                          <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-[rgba(239,68,68,0.12)] text-[#f87171]">
-                            ${v.toFixed(2)}
-                          </span>
-                        );
-                      })() : '—'}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+                {/* Bottom stats row */}
+                <div className="flex items-center justify-between px-4 py-3 border-t border-[rgba(255,255,255,0.06)] text-xs">
+                  <div className="flex items-center gap-3">
+                    {profit && (
+                      <span className={`font-mono ${isArb ? 'text-[#22c55e] font-semibold' : 'text-[#9ca3af]'}`}>
+                        {profit}%
+                      </span>
+                    )}
+                    {bfaBetIdx >= 0 && row[bfaBetIdx] && (
+                      <span className="text-[#9ca3af]">
+                        BFA <span className="font-mono text-[#e5e7eb]">${row[bfaBetIdx]}</span>
+                      </span>
+                    )}
+                    {polyBetIdx >= 0 && row[polyBetIdx] && (
+                      <span className="text-[#9ca3af]">
+                        Poly <span className="font-mono text-[#a78bfa]">${row[polyBetIdx]}</span>
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-3">
+                    {pnlIdx >= 0 && row[pnlIdx] && (() => {
+                      const v = parseFloat(row[pnlIdx]);
+                      return (
+                        <span className={`font-mono ${v >= 0 ? 'text-[#22c55e]' : 'text-[#f87171]'}`}>
+                          P&L {v >= 0 ? '+' : ''}${v.toFixed(2)}
+                        </span>
+                      );
+                    })()}
+                    {netValIdx >= 0 && row[netValIdx] && (() => {
+                      const v = parseFloat(row[netValIdx]);
+                      return (
+                        <span className={`font-mono font-semibold px-2 py-0.5 rounded-full ${
+                          v >= 0
+                            ? 'bg-[rgba(34,197,94,0.15)] text-[#22c55e]'
+                            : 'bg-[rgba(239,68,68,0.12)] text-[#f87171]'
+                        }`}>
+                          {v >= 0 ? '+' : ''}${v.toFixed(2)}
+                        </span>
+                      );
+                    })()}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
         </div>
       )}
     </>

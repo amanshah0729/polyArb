@@ -1,8 +1,8 @@
 /**
  * BFAGaming ↔ Polymarket Arbitrage Scanner — Core Module
  *
+ * Uses Predexon API exclusively for Polymarket market discovery + pricing.
  * Exports runScan() which returns an array of result objects.
- * Used by both the CLI script (getBFAGamingArb.js) and the notifier service.
  */
 
 require('dotenv').config({ path: require('path').join(__dirname, '..', '..', '.env') });
@@ -11,12 +11,10 @@ const https = require('https');
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const PREDEXON_API_KEY = process.env.PREDEXON_API_KEY;
-const POLYMARKET_BASE  = 'https://gamma-api.polymarket.com';
 const BFA_BASE         = 'https://api.bfagaming.com/oddsservice';
 const PREDEXON_HOST    = 'api.predexon.com';
 const PREDEXON_BASE    = '/v2';
 // Broad set of slugs to probe — BFA has no listing endpoint, so we try all known slugs
-// and keep the ones that return games.
 const ALL_BFA_SLUGS = [
   'nba', 'nhl', 'nfl', 'mlb', 'ufc', 'mma', 'boxing',
   'soccer', 'tennis', 'golf', 'cricket', 'rugby',
@@ -67,6 +65,17 @@ function get(url, extraHeaders = {}) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** Fetch the actual ask price (what you pay to buy) from Polymarket CLOB */
+async function getPolyAskPrice(tokenId) {
+  try {
+    // side=SELL returns the best ask — the price you'd pay to acquire the token
+    const data = await get(`https://clob.polymarket.com/price?token_id=${tokenId}&side=SELL`);
+    return parseFloat(data.price) || null;
+  } catch {
+    return null;
+  }
+}
+
 // ── American odds helpers ─────────────────────────────────────────────────────
 
 function americanToImplied(odds) {
@@ -78,8 +87,6 @@ function americanToImplied(odds) {
 
 /**
  * Fetch BFA games for a sport slug. Returns one entry per game+market-type combo.
- * Each entry has: { name, startDate, status, awayTeam, homeTeam, marketType,
- *   line (null for ML), awayOdds, homeOdds, awayImplied, homeImplied }
  * For totals: "away" = over, "home" = under (side 4 / side 5).
  */
 async function fetchBFAGames(slug) {
@@ -124,28 +131,26 @@ async function fetchBFAGames(slug) {
             homeImplied: americanToImplied(homeOddsObj.price),
           });
         } else if (marketType === 'spread') {
-          // side 1 = home, side 2 = away; line is on odds object
           const awayOddsObj = mkt.odds.find((o) => o.side === 2);
           const homeOddsObj = mkt.odds.find((o) => o.side === 1);
           if (!awayOddsObj || !homeOddsObj) continue;
           entries.push({
-            ...base, marketType, line: homeOddsObj.line, // home spread line (e.g. -1.5)
+            ...base, marketType, line: homeOddsObj.line,
             awayOdds: awayOddsObj.price, homeOdds: homeOddsObj.price,
             awayImplied: americanToImplied(awayOddsObj.price),
             homeImplied: americanToImplied(homeOddsObj.price),
           });
         } else if (marketType === 'total') {
-          // side 4 = over, side 5 = under
           const overObj = mkt.odds.find((o) => o.side === 4);
           const underObj = mkt.odds.find((o) => o.side === 5);
           if (!overObj || !underObj) continue;
           entries.push({
-            ...base, marketType, line: overObj.line, // total line (e.g. 6.5)
-            awayOdds: overObj.price, homeOdds: underObj.price, // away=over, home=under
+            ...base, marketType, line: overObj.line,
+            awayOdds: overObj.price, homeOdds: underObj.price,
             awayImplied: americanToImplied(overObj.price),
             homeImplied: americanToImplied(underObj.price),
             awayTeam: 'Over', homeTeam: 'Under',
-            _realAway: away.name, _realHome: home.name, // keep for matching
+            _realAway: away.name, _realHome: home.name,
           });
         }
       }
@@ -162,180 +167,182 @@ async function fetchBFAGames(slug) {
   }
 }
 
-// ── Polymarket (gamma API — for discovery + conditionId only) ─────────────────
+// ── Predexon — search + prices ───────────────────────────────────────────────
 
-// Generic/root tags to skip when looking for sport-specific tags
-const GENERIC_TAGS = new Set(['1', '100639']);
-
-async function getPolyTagId(sportKey) {
-  const sports = await get(`${POLYMARKET_BASE}/sports`);
-  const entry = sports.find((s) => s.sport && s.sport.toLowerCase() === sportKey);
-  if (!entry) return null;
-
-  const tagIds = typeof entry.tags === 'string'
-    ? entry.tags.split(',').map((t) => t.trim())
-    : (Array.isArray(entry.tags) ? entry.tags : []);
-
-  // Pick the first sport-specific tag (skip generic root tags)
-  const specific = tagIds.find((t) => !GENERIC_TAGS.has(t));
-  // Fall back to generic if no specific tag exists (e.g. UFC only has 1,100639)
-  return specific ?? tagIds[1] ?? tagIds[0] ?? null;
-}
-
-async function fetchPolyEvents(tagId) {
-  const all = [];
-  let offset = 0;
-  const limit = 100;
-
-  while (true) {
-    const url = `${POLYMARKET_BASE}/events?tag_id=${tagId}&closed=false&limit=${limit}&offset=${offset}&order=startDate&ascending=true`;
-    const events = await get(url);
-    if (!Array.isArray(events) || events.length === 0) break;
-    all.push(...events);
-    if (events.length < limit) break;
-    offset += limit;
-    await sleep(100);
+/**
+ * Search Predexon for Polymarket markets matching a query.
+ * Returns raw market objects with condition_id, title, slug, outcomes, volume.
+ */
+async function searchPredexon(query) {
+  const url = `https://${PREDEXON_HOST}${PREDEXON_BASE}/polymarket/markets?search=${encodeURIComponent(query)}&status=open`;
+  try {
+    const data = await get(url, { 'x-api-key': PREDEXON_API_KEY });
+    return data.markets ?? [];
+  } catch (err) {
+    console.warn(`    Predexon search error for "${query}": ${err.message}`);
+    return [];
   }
-
-  return all;
-}
-
-function extractTeamsFromTitle(title) {
-  if (!title) return { away: null, home: null };
-  const m = title.match(/^(.+?)\s+(?:vs\.?|@|versus|at)\s+(.+)$/i);
-  if (m) return { away: m[1].trim(), home: m[2].trim() };
-  return { away: null, home: null };
 }
 
 /**
- * Parse gamma events into market records.
- * Returns one entry per market (moneyline, spread, total) with conditionId.
+ * From a Predexon search result set, find the best matching live market for a BFA entry.
+ * Returns { market, swapped } or null.
+ *
+ * "swapped" means BFA-away corresponds to Predexon outcome[1] instead of outcome[0].
  */
-function parsePolyEvents(events) {
-  const records = [];
+// Map BFA sport slugs to Predexon slug prefixes for cross-sport filtering
+const SPORT_SLUG_PREFIXES = {
+  nba: ['nba-'],
+  nhl: ['nhl-'],
+  nfl: ['nfl-'],
+  mlb: ['mlb-'],
+  ufc: [], // UFC slugs don't have a consistent prefix, skip filtering
+  mma: [],
+};
 
-  for (const event of events) {
-    if (!event.markets) continue;
+const MAX_DATE_DRIFT_DAYS = 2; // max days apart before we consider a market stale/rescheduled
 
-    // Determine teams from event title once
-    const teams = extractTeamsFromTitle(event.title);
+function extractSlugDate(slug) {
+  const m = slug.match(/(\d{4}-\d{2}-\d{2})$/);
+  return m ? m[1] : null;
+}
 
-    for (const m of event.markets) {
-      const type = m.sportsMarketType;
-      if (!type || !m.conditionId) continue;
+function datesWithinRange(bfaStartDate, slugDateStr) {
+  if (!bfaStartDate || !slugDateStr) return true; // can't verify, allow through
+  const bfaDate = new Date(bfaStartDate);
+  const polyDate = new Date(slugDateStr + 'T00:00:00Z');
+  if (isNaN(bfaDate) || isNaN(polyDate)) return true;
+  const diffMs = Math.abs(bfaDate - polyDate);
+  const diffDays = diffMs / (1000 * 60 * 60 * 24);
+  return diffDays <= MAX_DATE_DRIFT_DAYS;
+}
 
-      let outcomes;
-      try {
-        outcomes = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes;
-      } catch { continue; }
-      if (!Array.isArray(outcomes) || outcomes.length !== 2) continue;
+function matchPredexonMarket(bfaEntry, predexonMarkets, sportSlug) {
+  const mt = bfaEntry.marketType;
+  const awayName = bfaEntry.marketType === 'total' ? (bfaEntry._realAway ?? '') : bfaEntry.awayTeam;
+  const homeName = bfaEntry.marketType === 'total' ? (bfaEntry._realHome ?? '') : bfaEntry.homeTeam;
 
-      if (type === 'moneyline') {
-        let awayTeam, homeTeam;
-        if (teams.away && teams.home) {
-          const o0 = outcomes[0].toLowerCase();
-          const awayL = teams.away.toLowerCase();
-          if (o0.includes(awayL) || awayL.includes(o0)) {
-            awayTeam = outcomes[0]; homeTeam = outcomes[1];
-          } else {
-            awayTeam = outcomes[1]; homeTeam = outcomes[0];
-          }
-        } else {
-          awayTeam = outcomes[0]; homeTeam = outcomes[1];
-        }
-        records.push({
-          title: event.title, conditionId: m.conditionId,
-          marketType: 'moneyline', line: null,
-          awayTeam, homeTeam,
-        });
+  const allowedPrefixes = SPORT_SLUG_PREFIXES[sportSlug] ?? [];
 
-      } else if (type === 'spreads') {
-        // question format: "Spread: TeamName (-1.5)"
-        const spreadMatch = (m.question ?? '').match(/Spread:\s*(.+?)\s*\(([+-]?\d+\.?\d*)\)/i);
-        if (!spreadMatch) continue;
-        const spreadTeam = spreadMatch[1].trim();
-        const spreadLine = parseFloat(spreadMatch[2]);
-        // outcomes = [spreadTeam, otherTeam] — first outcome is the team in the question
-        let awayTeam, homeTeam;
-        if (teams.away && teams.home) {
-          const o0 = outcomes[0].toLowerCase();
-          const awayL = teams.away.toLowerCase();
-          if (o0.includes(awayL) || awayL.includes(o0)) {
-            awayTeam = outcomes[0]; homeTeam = outcomes[1];
-          } else {
-            awayTeam = outcomes[1]; homeTeam = outcomes[0];
-          }
-        } else {
-          awayTeam = outcomes[0]; homeTeam = outcomes[1];
-        }
-        // Determine which team the spread belongs to — match spreadTeam to home
-        const homeSpreadLine = teamsMatch(spreadTeam, homeTeam) ? spreadLine
-          : teamsMatch(spreadTeam, awayTeam) ? -spreadLine : spreadLine;
-        records.push({
-          title: event.title, conditionId: m.conditionId,
-          marketType: 'spread', line: homeSpreadLine,
-          awayTeam, homeTeam, spreadTeam,
-        });
+  for (const mkt of predexonMarkets) {
+    const outcomes = mkt.outcomes ?? [];
+    if (outcomes.length !== 2) continue;
 
-      } else if (type === 'totals') {
-        // question format: "Team A vs. Team B: O/U 6.5"
-        const totalMatch = (m.question ?? '').match(/O\/U\s+(\d+\.?\d*)/i);
-        if (!totalMatch) continue;
-        const totalLine = parseFloat(totalMatch[1]);
-        // outcomes = ["Over", "Under"]
-        records.push({
-          title: event.title, conditionId: m.conditionId,
-          marketType: 'total', line: totalLine,
-          awayTeam: 'Over', homeTeam: 'Under',
-          _eventTitle: event.title,
-        });
+    const [o0, o1] = outcomes;
+    const p0 = o0.price ?? 0;
+    const p1 = o1.price ?? 0;
+    const t0 = o0.token_id ?? '';
+    const t1 = o1.token_id ?? '';
+
+    // Skip resolved markets (0/1 prices)
+    if (p0 < 0.01 || p0 > 0.99 || p1 < 0.01 || p1 > 0.99) continue;
+    // Skip 0-volume
+    if ((mkt.total_volume_usd ?? 0) === 0) continue;
+
+    const slug = (mkt.market_slug ?? '').toLowerCase();
+
+    // Date cross-check: skip markets where the Polymarket event date doesn't match BFA's date.
+    // Catches cancelled/rescheduled events where Poly still has the old stale market.
+    const slugDate = extractSlugDate(slug);
+    if (!datesWithinRange(bfaEntry.startDate, slugDate)) {
+      const bfaDateStr = bfaEntry.startDate ? new Date(bfaEntry.startDate).toISOString().split('T')[0] : '?';
+      console.log(`    ⚠ Date mismatch: BFA=${bfaDateStr} vs Poly=${slugDate} — skipping ${slug}`);
+      continue;
+    }
+
+    // Cross-sport filter: if we know the sport prefix, reject mismatches
+    if (allowedPrefixes.length > 0 && !allowedPrefixes.some(p => slug.startsWith(p))) continue;
+    const title = (mkt.title ?? '').toLowerCase();
+    const l0 = (o0.label ?? '').toLowerCase();
+    const l1 = (o1.label ?? '').toLowerCase();
+
+    if (mt === 'moneyline') {
+      // Slug should NOT contain 'total' or 'spread'
+      if (slug.includes('total') || slug.includes('spread') || slug.includes('o-u') || slug.includes('pt')) continue;
+      // Labels should be team/fighter names, not Over/Under
+      if (l0 === 'over' || l0 === 'under' || l1 === 'over' || l1 === 'under') continue;
+
+      // BOTH teams must appear in the market labels to prevent cross-sport false matches
+      // Use strict matching: label must equal normalized name, or one must fully contain the other
+      const awayNorm = normalizeTeam(awayName);
+      const homeNorm = normalizeTeam(homeName);
+
+      function labelMatches(label, norm) {
+        if (!label || !norm) return false;
+        // Exact match or label equals the norm
+        if (label === norm) return true;
+        // The label is a full team name containing the normalized nickname
+        // but the normalized name must be at least 4 chars to avoid short false matches
+        if (norm.length >= 4 && label.includes(norm) && label.split(/\s+/).some(w => norm.includes(w))) return true;
+        if (norm.includes(label) && label.length >= 4) return true;
+        return false;
+      }
+
+      const awayInL0 = labelMatches(l0, awayNorm);
+      const awayInL1 = labelMatches(l1, awayNorm);
+      const homeInL0 = labelMatches(l0, homeNorm);
+      const homeInL1 = labelMatches(l1, homeNorm);
+
+      // Both teams must be present across the two labels
+      if (!((awayInL0 || awayInL1) && (homeInL0 || homeInL1))) continue;
+
+      // Determine which outcome is away vs home
+      if (awayInL0) {
+        return { market: mkt, awayPrice: p0, homePrice: p1, awayToken: t0, homeToken: t1, swapped: false };
+      }
+      if (homeInL0) {
+        return { market: mkt, awayPrice: p1, homePrice: p0, awayToken: t1, homeToken: t0, swapped: true };
+      }
+
+    } else if (mt === 'total') {
+      // Match by total line in slug or title: "total-6pt5" or "O/U 6.5"
+      const bfaLine = bfaEntry.line;
+      if (!slug.includes('total') && !title.includes('o/u')) continue;
+      // Strict line matching — lines must match exactly (6 !== 6.5, 7 !== 7.5)
+      const lineStr = String(bfaLine).replace('.', 'pt');
+      const lineRe = new RegExp(`(^|[^0-9])${lineStr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}($|[^0-9pt])`);
+      const titleRe = new RegExp(`(^|[^0-9.])${String(bfaLine).replace('.', '\\.')}($|[^0-9.])`);
+      if (!lineRe.test(slug) && !titleRe.test(title)) continue;
+      // Verify teams appear in the title to prevent cross-sport matches
+      const awayNorm = normalizeTeam(awayName);
+      const homeNorm = normalizeTeam(homeName);
+      if (!title.includes(awayNorm) && !title.includes(homeNorm)) continue;
+
+      // Outcomes should be Over/Under
+      if (l0 === 'over') {
+        return { market: mkt, awayPrice: p0, homePrice: p1, awayToken: t0, homeToken: t1, swapped: false };
+      }
+      if (l0 === 'under') {
+        return { market: mkt, awayPrice: p1, homePrice: p0, awayToken: t1, homeToken: t0, swapped: true };
+      }
+
+    } else if (mt === 'spread') {
+      // Match by spread in slug or title
+      if (!slug.includes('spread') && !title.includes('spread')) continue;
+
+      const bfaLine = bfaEntry.line;
+      // Strict line matching — lines must match exactly (3 !== 3.5)
+      const lineStr = String(Math.abs(bfaLine)).replace('.', 'pt');
+      const lineRe = new RegExp(`(^|[^0-9])${lineStr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}($|[^0-9pt])`);
+      const titleRe = new RegExp(`(^|[^0-9.])${String(Math.abs(bfaLine)).replace('.', '\\.')}($|[^0-9.])`);
+      if (!lineRe.test(slug) && !titleRe.test(title)) continue;
+
+      // Verify teams appear
+      const awayNorm = normalizeTeam(awayName);
+      const homeNorm = normalizeTeam(homeName);
+      const allText = `${l0} ${l1} ${title}`;
+      if (!(allText.includes(awayNorm) || awayNorm.includes(l0) || awayNorm.includes(l1))) continue;
+      if (!(allText.includes(homeNorm) || homeNorm.includes(l0) || homeNorm.includes(l1))) continue;
+      if (l0.includes(awayNorm) || awayNorm.includes(l0)) {
+        return { market: mkt, awayPrice: p0, homePrice: p1, awayToken: t0, homeToken: t1, swapped: false };
+      }
+      if (l0.includes(homeNorm) || homeNorm.includes(l0)) {
+        return { market: mkt, awayPrice: p1, homePrice: p0, awayToken: t1, homeToken: t0, swapped: true };
       }
     }
   }
 
-  return records;
-}
-
-// ── Predexon — prices + volume ────────────────────────────────────────────────
-
-async function fetchPredexonPrices(conditionId, awayLabel, homeLabel) {
-  if (!PREDEXON_API_KEY) throw new Error('PREDEXON_API_KEY missing in .env');
-
-  const url = `https://${PREDEXON_HOST}${PREDEXON_BASE}/polymarket/markets?condition_id=${conditionId}`;
-  let data;
-  try {
-    data = await get(url, { 'x-api-key': PREDEXON_API_KEY });
-  } catch (err) {
-    console.warn(`    Predexon error for ${conditionId.slice(0, 10)}…: ${err.message}`);
-    return null;
-  }
-
-  const market = data.markets?.[0];
-  if (!market) return null;
-
-  const volumeUsd = market.total_volume_usd ?? 0;
-  if (volumeUsd === 0) return null;
-
-  if (!Array.isArray(market.outcomes) || market.outcomes.length !== 2) return null;
-
-  const [o0, o1] = market.outcomes;
-  let awayPrice, homePrice;
-
-  const label0 = (o0.label ?? '').toLowerCase();
-  const normAway = normalizeTeam(awayLabel);
-  const normHome = normalizeTeam(homeLabel);
-
-  if (label0.includes(normAway) || normAway.includes(label0)) {
-    awayPrice = o0.price; homePrice = o1.price;
-  } else if (label0.includes(normHome) || normHome.includes(label0)) {
-    awayPrice = o1.price; homePrice = o0.price;
-  } else {
-    awayPrice = o0.price; homePrice = o1.price;
-  }
-
-  if (isNaN(awayPrice) || isNaN(homePrice)) return null;
-
-  return { awayImplied: awayPrice, homeImplied: homePrice, volumeUsd };
+  return null;
 }
 
 // ── Team matching ─────────────────────────────────────────────────────────────
@@ -418,50 +425,6 @@ function normalizeTeam(name) {
   return n.trim();
 }
 
-function teamsMatch(a, b) {
-  const na = normalizeTeam(a);
-  const nb = normalizeTeam(b);
-  if (!na || !nb) return false;
-  if (na === nb) return true;
-  if (na.includes(nb) || nb.includes(na)) return true;
-  return false;
-}
-
-/**
- * Find a matching Polymarket record for a BFA entry.
- * Matches on: market type + team names + line (for spreads/totals).
- */
-function findPolyMatch(bfaEntry, polyRecords) {
-  const mt = bfaEntry.marketType;
-
-  for (const pr of polyRecords) {
-    if (pr.marketType !== mt) continue;
-
-    if (mt === 'moneyline') {
-      if (
-        (teamsMatch(bfaEntry.awayTeam, pr.awayTeam) && teamsMatch(bfaEntry.homeTeam, pr.homeTeam)) ||
-        (teamsMatch(bfaEntry.awayTeam, pr.homeTeam) && teamsMatch(bfaEntry.homeTeam, pr.awayTeam))
-      ) return pr;
-
-    } else if (mt === 'spread') {
-      // Match teams AND spread line (BFA line = home spread, Poly line = home spread)
-      const teamsOk =
-        (teamsMatch(bfaEntry.awayTeam, pr.awayTeam) && teamsMatch(bfaEntry.homeTeam, pr.homeTeam)) ||
-        (teamsMatch(bfaEntry.awayTeam, pr.homeTeam) && teamsMatch(bfaEntry.homeTeam, pr.awayTeam));
-      if (teamsOk && bfaEntry.line === pr.line) return pr;
-
-    } else if (mt === 'total') {
-      // Match by event title (teams) and total line
-      const realAway = bfaEntry._realAway ?? bfaEntry.awayTeam;
-      const realHome = bfaEntry._realHome ?? bfaEntry.homeTeam;
-      const polyTitle = (pr._eventTitle ?? pr.title ?? '').toLowerCase();
-      const teamsOk = polyTitle.includes(normalizeTeam(realAway)) || polyTitle.includes(normalizeTeam(realHome));
-      if (teamsOk && bfaEntry.line === pr.line) return pr;
-    }
-  }
-  return null;
-}
-
 // ── Bet sizing ────────────────────────────────────────────────────────────────
 
 function sizeBet(b, p, C, r, bkr) {
@@ -500,7 +463,9 @@ function checkArb(bfaEntry, polyPrices) {
   const polyAway = polyPrices.awayImplied;
   const polyHome = polyPrices.homeImplied;
 
+  // option1: bet BFA-away + Poly-home  (hedging opposite sides)
   const option1 = bfaAway + polyHome;
+  // option2: bet Poly-away + BFA-home
   const option2 = polyAway + bfaHome;
 
   const bestCost = Math.min(option1, option2);
@@ -527,11 +492,6 @@ function checkArb(bfaEntry, polyPrices) {
 
 // ── Main scan function ────────────────────────────────────────────────────────
 
-/**
- * Run a full BFA↔Polymarket arb scan.
- * @param {{ rolloverRemaining?: number, bankroll?: number }} opts
- * @returns {Promise<Array>} array of result objects
- */
 async function runScan(opts = {}) {
   const rolloverRemaining = opts.rolloverRemaining ?? ROLLOVER;
   const bankroll = opts.bankroll ?? 300;
@@ -549,78 +509,106 @@ async function runScan(opts = {}) {
 
   const allResults = [];
 
+  // Deduplicate Predexon searches: group BFA entries by game (same away+home teams)
   for (const { slug, entries: bfaEntries } of activeSports) {
     console.log(`[${slug.toUpperCase()}]`);
 
-    // Fetch Polymarket records for this sport
-    let polyRecords = [];
-    try {
-      const tagId = await getPolyTagId(slug);
-      if (tagId) {
-        const rawEvents = await fetchPolyEvents(tagId);
-        polyRecords = parsePolyEvents(rawEvents);
-        const mlCount = polyRecords.filter(r => r.marketType === 'moneyline').length;
-        const spCount = polyRecords.filter(r => r.marketType === 'spread').length;
-        const totCount = polyRecords.filter(r => r.marketType === 'total').length;
-        console.log(`  Polymarket ${slug.toUpperCase()}: ${mlCount} ML, ${spCount} spreads, ${totCount} totals`);
-      } else {
-        console.warn(`  No Polymarket tag for ${slug}`);
-      }
-    } catch (err) {
-      console.warn(`  Polymarket discovery error: ${err.message}`);
+    // Group entries by game to share one Predexon search per matchup
+    const gameGroups = new Map();
+    for (const entry of bfaEntries) {
+      const realAway = entry._realAway ?? entry.awayTeam;
+      const realHome = entry._realHome ?? entry.homeTeam;
+      const key = `${realAway}|||${realHome}`;
+      if (!gameGroups.has(key)) gameGroups.set(key, { realAway, realHome, entries: [] });
+      gameGroups.get(key).entries.push(entry);
     }
 
-    for (const bfaEntry of bfaEntries) {
-      const polyMatch = findPolyMatch(bfaEntry, polyRecords);
-      const displayName = bfaEntry.marketType === 'total'
-        ? `${bfaEntry._realAway ?? '?'} @ ${bfaEntry._realHome ?? '?'} O/U ${bfaEntry.line}`
-        : `${bfaEntry.awayTeam} @ ${bfaEntry.homeTeam}${bfaEntry.line != null ? ` (${bfaEntry.line})` : ''}`;
-      const mtTag = bfaEntry.marketType !== 'moneyline' ? ` [${bfaEntry.marketType}]` : '';
+    for (const [, { realAway, realHome, entries }] of gameGroups) {
+      // Build search query — use normalized (city-stripped) names for better search results
+      // Full names like "Boston Bruins" return too many futures; "Bruins" finds the game
+      const normAway = normalizeTeam(realAway);
+      const normHome = normalizeTeam(realHome);
+      const query = `${normAway} ${normHome}`;
 
-      if (!polyMatch) {
-        console.log(`    No Poly match: ${displayName}${mtTag}`);
-        continue;
-      }
-
-      process.stdout.write(`    ${displayName}${mtTag} → Predexon... `);
-      const polyPrices = await fetchPredexonPrices(polyMatch.conditionId, polyMatch.awayTeam, polyMatch.homeTeam);
+      const predexonMarkets = await searchPredexon(query);
       await sleep(RATE_LIMIT_MS);
 
-      if (!polyPrices) {
-        console.log('skipped (0 volume or unavailable)');
-        continue;
+      const liveCount = predexonMarkets.filter(m => {
+        const outcomes = m.outcomes ?? [];
+        if (outcomes.length !== 2) return false;
+        return outcomes.every(o => o.price > 0.01 && o.price < 0.99) && (m.total_volume_usd ?? 0) > 0;
+      }).length;
+
+      if (liveCount > 0) {
+        console.log(`  Predexon "${query}": ${predexonMarkets.length} results, ${liveCount} live`);
       }
 
-      const arb = checkArb(bfaEntry, polyPrices);
-      const sized = sizeBet(arb.bfaImplied, arb.polyImplied, arb.bestCost, rolloverRemaining, bankroll);
-      console.log(`vol=$${Math.round(polyPrices.volumeUsd).toLocaleString()}  cost=${arb.bestCost.toFixed(4)}  W=$${sized.W}  P=$${sized.P}  net=${sized.netValue >= 0 ? '+' : ''}$${sized.netValue.toFixed(2)}${arb.hasArb ? '  *** ARB ***' : ''}`);
+      for (const bfaEntry of entries) {
+        const displayName = bfaEntry.marketType === 'total'
+          ? `${realAway} @ ${realHome} O/U ${bfaEntry.line}`
+          : `${bfaEntry.awayTeam} @ ${bfaEntry.homeTeam}${bfaEntry.line != null ? ` (${bfaEntry.line})` : ''}`;
+        const mtTag = bfaEntry.marketType !== 'moneyline' ? ` [${bfaEntry.marketType}]` : '';
 
-      const startDate = bfaEntry.startDate ? new Date(bfaEntry.startDate) : null;
+        const match = matchPredexonMarket(bfaEntry, predexonMarkets, slug);
 
-      allResults.push({
-        date: startDate ? startDate.toLocaleDateString() : '',
-        time: startDate ? startDate.toLocaleTimeString() : '',
-        sport: slug.toUpperCase(),
-        marketType: bfaEntry.marketType,
-        line: bfaEntry.line != null ? String(bfaEntry.line) : '',
-        awayTeam: bfaEntry.marketType === 'total' ? (bfaEntry._realAway ?? 'Over') : bfaEntry.awayTeam,
-        homeTeam: bfaEntry.marketType === 'total' ? (bfaEntry._realHome ?? 'Under') : bfaEntry.homeTeam,
-        status: String(bfaEntry.status),
-        hasArb: arb.hasArb,
-        strategy: arb.strategy,
-        bfaAwayOdds: bfaEntry.awayOdds,
-        bfaAwayImplied: bfaEntry.awayImplied,
-        bfaHomeOdds: bfaEntry.homeOdds,
-        bfaHomeImplied: bfaEntry.homeImplied,
-        polyAwayImplied: polyPrices.awayImplied,
-        polyHomeImplied: polyPrices.homeImplied,
-        profitPct: arb.profitPct,
-        bestCost: arb.bestCost,
-        bfaBet: sized.W,
-        polyBet: sized.P,
-        guaranteedPnl: sized.guaranteedPnl,
-        netValue: sized.netValue,
-      });
+        if (!match) {
+          console.log(`    No match: ${displayName}${mtTag}`);
+          continue;
+        }
+
+        const { market: mkt, awayPrice: midAway, homePrice: midHome, awayToken, homeToken } = match;
+        const volumeUsd = mkt.total_volume_usd ?? 0;
+
+        // Skip low-volume markets (unreliable pricing)
+        if (volumeUsd < 300) {
+          console.log(`    ${displayName}${mtTag} → skipped (vol=$${Math.round(volumeUsd)})`);
+          continue;
+        }
+
+        // Fetch actual ask prices from Polymarket CLOB (what you'd really pay to buy)
+        const [awayAsk, homeAsk] = await Promise.all([
+          getPolyAskPrice(awayToken),
+          getPolyAskPrice(homeToken),
+        ]);
+        const awayPrice = awayAsk ?? midAway;
+        const homePrice = homeAsk ?? midHome;
+
+        const polyPrices = { awayImplied: awayPrice, homeImplied: homePrice, volumeUsd };
+
+        const arb = checkArb(bfaEntry, polyPrices);
+        const sized = sizeBet(arb.bfaImplied, arb.polyImplied, arb.bestCost, rolloverRemaining, bankroll);
+
+        process.stdout.write(`    ${displayName}${mtTag} → `);
+        console.log(`vol=$${Math.round(volumeUsd).toLocaleString()}  cost=${arb.bestCost.toFixed(4)}  W=$${sized.W}  P=$${sized.P}  net=${sized.netValue >= 0 ? '+' : ''}$${sized.netValue.toFixed(2)}${arb.hasArb ? '  *** ARB ***' : ''}`);
+
+        const startDate = bfaEntry.startDate ? new Date(bfaEntry.startDate) : null;
+
+        allResults.push({
+          date: startDate ? startDate.toLocaleDateString() : '',
+          time: startDate ? startDate.toLocaleTimeString() : '',
+          sport: slug.toUpperCase(),
+          marketType: bfaEntry.marketType,
+          line: bfaEntry.line != null ? String(bfaEntry.line) : '',
+          awayTeam: bfaEntry.marketType === 'total' ? realAway : bfaEntry.awayTeam,
+          homeTeam: bfaEntry.marketType === 'total' ? realHome : bfaEntry.homeTeam,
+          status: String(bfaEntry.status),
+          hasArb: arb.hasArb,
+          strategy: arb.strategy,
+          bfaAwayOdds: bfaEntry.awayOdds,
+          bfaAwayImplied: bfaEntry.awayImplied,
+          bfaHomeOdds: bfaEntry.homeOdds,
+          bfaHomeImplied: bfaEntry.homeImplied,
+          polyAwayImplied: polyPrices.awayImplied,
+          polyHomeImplied: polyPrices.homeImplied,
+          profitPct: arb.profitPct,
+          bestCost: arb.bestCost,
+          bfaBet: sized.W,
+          polyBet: sized.P,
+          guaranteedPnl: sized.guaranteedPnl,
+          netValue: sized.netValue,
+          volumeUsd,
+        });
+      }
     }
   }
 
@@ -635,4 +623,10 @@ async function runScan(opts = {}) {
   return allResults;
 }
 
-module.exports = { runScan, ALL_BFA_SLUGS };
+module.exports = {
+  runScan, ALL_BFA_SLUGS,
+  // Shared utilities for other scanners
+  get, sleep, americanToImplied, normalizeTeam, CITY_MAP,
+  SPORT_SLUG_PREFIXES, matchPredexonMarket, searchPredexon,
+  getPolyAskPrice, PREDEXON_API_KEY, RATE_LIMIT_MS,
+};

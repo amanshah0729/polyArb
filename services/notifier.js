@@ -15,8 +15,13 @@
 
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const { Resend } = require('resend');
 const { runScan } = require('../scripts/bfagaming/scan');
+
+const OUT_DIR = path.join(__dirname, '..', 'outputs', 'bfagaming');
+fs.mkdirSync(OUT_DIR, { recursive: true });
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -111,11 +116,58 @@ async function sendArbEmail(arbs) {
   }
 }
 
+// ── CSV output (for dashboard) ────────────────────────────────────────────────
+
+function writeCSV(results) {
+  const csvHeader = [
+    'Date', 'Time', 'Sport', 'Market Type', 'Line',
+    'Away Team', 'Home Team', 'Status',
+    'Arb Opportunity', 'Strategy',
+    'BFAGaming Away Odds', 'BFAGaming Away Implied (%)',
+    'BFAGaming Home Odds', 'BFAGaming Home Implied (%)',
+    'Polymarket Away Implied (%)', 'Polymarket Home Implied (%)',
+    'Profit %', 'Best Option Cost',
+    'BFA Bet ($)', 'Poly Bet ($)', 'Guaranteed P&L ($)', 'Net Value ($)', 'Volume ($)',
+  ].join(',');
+
+  const csvRows = results.map((r) => [
+    `"${r.date}"`,
+    `"${r.time}"`,
+    `"${r.sport}"`,
+    `"${r.marketType}"`,
+    `"${r.line}"`,
+    `"${r.awayTeam}"`,
+    `"${r.homeTeam}"`,
+    `"${r.status}"`,
+    `"${r.hasArb ? 'YES' : 'NO'}"`,
+    `"${r.strategy}"`,
+    r.bfaAwayOdds,
+    (r.bfaAwayImplied * 100).toFixed(2),
+    r.bfaHomeOdds,
+    (r.bfaHomeImplied * 100).toFixed(2),
+    (r.polyAwayImplied * 100).toFixed(2),
+    (r.polyHomeImplied * 100).toFixed(2),
+    r.profitPct.toFixed(2),
+    r.bestCost.toFixed(4),
+    r.bfaBet.toFixed(2),
+    r.polyBet.toFixed(2),
+    r.guaranteedPnl.toFixed(2),
+    r.netValue.toFixed(2),
+    Math.round(r.volumeUsd ?? 0),
+  ].join(','));
+
+  const today = new Date().toISOString().split('T')[0];
+  const outPath = path.join(OUT_DIR, `arb_bfagaming_${today}.csv`);
+  fs.writeFileSync(outPath, [csvHeader, ...csvRows].join('\n'), 'utf8');
+  console.log(`  CSV updated → ${outPath}`);
+}
+
 // ── Scan loop ─────────────────────────────────────────────────────────────────
 
 let scanning = false;
 let lastScanTime = null;
 let lastScanArbs = 0;
+let latestResults = [];
 
 async function tick() {
   if (scanning) {
@@ -131,6 +183,8 @@ async function tick() {
 
   try {
     const results = await runScan();
+    latestResults = results;
+    writeCSV(results);
     const arbs = results.filter((r) => r.hasArb && r.bestCost <= ARB_THRESHOLD);
 
     // Filter out already-notified arbs
@@ -164,14 +218,25 @@ function scheduleNext() {
 // ── Health server ─────────────────────────────────────────────────────────────
 
 const server = http.createServer((req, res) => {
+  const cors = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET',
+  };
+
   if (req.url === '/health' || req.url === '/') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.writeHead(200, { 'Content-Type': 'application/json', ...cors });
     res.end(JSON.stringify({
       status: 'ok',
       scanning,
       lastScanTime,
       lastScanArbs,
       notifiedCount: notified.size,
+    }));
+  } else if (req.url === '/results') {
+    res.writeHead(200, { 'Content-Type': 'application/json', ...cors });
+    res.end(JSON.stringify({
+      lastScanTime,
+      results: latestResults,
     }));
   } else {
     res.writeHead(404);

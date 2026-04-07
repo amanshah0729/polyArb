@@ -18,7 +18,30 @@
       "Bash(mkdir -p ~/Documents/slideshows)",
       "Bash(open ~/Documents/slideshows/safira-pitch.html)",
       "Bash(curl -s \"https://api.bfagaming.com/oddsservice/sports\" -H \"User-Agent: Mozilla/5.0\")",
-      "Bash(curl -s \"https://gamma-api.polymarket.com/events?tag_id=745&closed=false&limit=5\")"
+      "Bash(curl -s \"https://gamma-api.polymarket.com/events?tag_id=745&closed=false&limit=5\")",
+      "Bash(npx next:*)",
+      "Bash(curl -s \"https://api.predexon.com/v2/polymarket/markets/1766620/orderbook\" -H \"x-api-key: $\\(grep PREDEXON_API_KEY /Users/amanshah/Documents/Hackathons/polyArb/.env)",
+      "Bash(curl -s \"https://api.predexon.com/v2/polymarket/orderbook?condition_id=0x13f7be3d6ca19b03dba624c6c7c52ab6e6e94de415c5c87c1965c8214a3d1c0a\" -H \"x-api-key: $\\(grep PREDEXON_API_KEY /Users/amanshah/Documents/Hackathons/polyArb/.env)",
+      "Bash(curl -s \"https://clob.polymarket.com/book?token_id=65448416125570779603115460105805741822778482201477555477702639878705882431575\")",
+      "Bash(curl -s 'https://clob.polymarket.com/midpoint?token_id=65448416125570779603115460105805741822778482201477555477702639878705882431575')",
+      "Bash(curl -s 'https://clob.polymarket.com/price?token_id=65448416125570779603115460105805741822778482201477555477702639878705882431575&side=BUY')",
+      "Bash(curl -s 'https://clob.polymarket.com/price?token_id=65448416125570779603115460105805741822778482201477555477702639878705882431575&side=SELL')",
+      "Bash(curl -s 'https://clob.polymarket.com/midpoint?token_id=108697532337449889527858012107619690208476293937861500782537613575603320403170')",
+      "Bash(curl -s 'https://clob.polymarket.com/price?token_id=108697532337449889527858012107619690208476293937861500782537613575603320403170&side=BUY')",
+      "Bash(curl -s 'https://clob.polymarket.com/midpoint?token_id=1899710953114417820100543906663171075578413887428821265245642411986067341043')",
+      "Bash(curl -s 'https://clob.polymarket.com/price?token_id=1899710953114417820100543906663171075578413887428821265245642411986067341043&side=BUY')",
+      "Bash(curl -s 'https://clob.polymarket.com/midpoint?token_id=12335700092589711271663495456231450378697540287116993006176569045155170612829')",
+      "Bash(curl -s 'https://clob.polymarket.com/price?token_id=12335700092589711271663495456231450378697540287116993006176569045155170612829&side=BUY')",
+      "Bash(curl -s 'https://clob.polymarket.com/midpoint?token_id=__TRACKED_VAR__')",
+      "Bash(curl -s 'https://clob.polymarket.com/price?token_id=98497113289524612358604374606650131450183063761814888414802281121581752465865&side=BUY')",
+      "Bash(curl -s 'https://clob.polymarket.com/price?token_id=98497113289524612358604374606650131450183063761814888414802281121581752465865&side=SELL')",
+      "Bash(curl -s 'https://clob.polymarket.com/midpoint?token_id=98497113289524612358604374606650131450183063761814888414802281121581752465865')",
+      "Bash(curl -s 'https://clob.polymarket.com/price?token_id=78897059465117827414970673741344285269904096580330514363603209469852915359470&side=BUY')",
+      "Bash(curl -s 'https://clob.polymarket.com/price?token_id=78897059465117827414970673741344285269904096580330514363603209469852915359470&side=SELL')",
+      "Bash(head -100 /Users/amanshah/Documents/Hackathons/polyArb/outputs/nba/nba_games_*.csv)",
+      "Bash(curl -s \"https://api.the-odds-api.com/v4/sports/?apiKey=$\\(grep OPENAPI_API_KEY /Users/amanshah/Documents/Hackathons/polyArb/.env)",
+      "Bash(curl -s \"https://api.the-odds-api.com/v4/sports/basketball_nba/odds/?apiKey=$\\(grep OPENAPI_API_KEY /Users/amanshah/Documents/Hackathons/polyArb/.env)",
+      "Bash(grep -o '[0-9]\\\\{4\\\\}-[0-9]\\\\{2\\\\}-[0-9]\\\\{2\\\\}$')"
     ]
   }
 }
