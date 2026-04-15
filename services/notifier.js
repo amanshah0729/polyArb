@@ -28,7 +28,8 @@ fs.mkdirSync(OUT_DIR, { recursive: true });
 const PORT              = process.env.PORT || 3001;
 const RESEND_API_KEY    = process.env.RESEND_API_KEY;
 const NOTIFICATION_EMAIL = process.env.NOTIFICATION_EMAIL;
-const ARB_THRESHOLD     = 1.000; // cost must be <= this to trigger email
+const ARB_MIN_COST      = 0.95;  // email only when 0.95 <= cost <= 1.000
+const ARB_MAX_COST      = 1.000;
 const MIN_INTERVAL_MS   = 4 * 60 * 1000;  // 4 minutes
 const MAX_INTERVAL_MS   = 8 * 60 * 1000;  // 8 minutes
 
@@ -92,7 +93,7 @@ async function sendArbEmail(arbs) {
   const subject = `Arb Detected – ${count} opportunit${count === 1 ? 'y' : 'ies'} found`;
 
   const body = [
-    `${count} arb opportunit${count === 1 ? 'y' : 'ies'} (cost ≤ ${ARB_THRESHOLD.toFixed(3)}):`,
+    `${count} arb opportunit${count === 1 ? 'y' : 'ies'} (cost ${ARB_MIN_COST.toFixed(3)}–${ARB_MAX_COST.toFixed(3)}):`,
     '',
     ...lines.join('\n\n───────────────────────────\n\n').split('\n'),
     '',
@@ -185,7 +186,7 @@ async function tick() {
     const results = await runScan();
     latestResults = results;
     writeCSV(results);
-    const arbs = results.filter((r) => r.hasArb && r.bestCost <= ARB_THRESHOLD);
+    const arbs = results.filter((r) => r.hasArb && r.bestCost >= ARB_MIN_COST && r.bestCost <= ARB_MAX_COST);
 
     // Filter out already-notified arbs
     const newArbs = arbs.filter((a) => !alreadyNotified(a));
@@ -246,7 +247,7 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`Notifier health server on :${PORT}`);
-  console.log(`Threshold: cost ≤ ${ARB_THRESHOLD.toFixed(3)}`);
+  console.log(`Threshold: ${ARB_MIN_COST.toFixed(3)} ≤ cost ≤ ${ARB_MAX_COST.toFixed(3)}`);
   console.log(`Email: ${NOTIFICATION_EMAIL.replace(/(.{3}).*(@.*)/, '$1***$2')}`);
   console.log('Starting first scan...\n');
   tick();
