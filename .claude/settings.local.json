@@ -42,7 +42,12 @@
       "Bash(curl -s \"https://api.the-odds-api.com/v4/sports/?apiKey=$\\(grep OPENAPI_API_KEY /Users/amanshah/Documents/Hackathons/polyArb/.env)",
       "Bash(curl -s \"https://api.the-odds-api.com/v4/sports/basketball_nba/odds/?apiKey=$\\(grep OPENAPI_API_KEY /Users/amanshah/Documents/Hackathons/polyArb/.env)",
       "Bash(grep -o '[0-9]\\\\{4\\\\}-[0-9]\\\\{2\\\\}-[0-9]\\\\{2\\\\}$')",
-      "Bash(npm prune *)"
+      "Bash(npm prune *)",
+      "Bash(npm i *)",
+      "Bash(npx playwright *)",
+      "Bash(ls -la /Users/amanshah/Documents/Hackathons/polyArb/priv/bfa-*.json)",
+      "Bash(grep -l \"intent\\\\|ORDER_INTENT\\\\|marketSlug\\\\|book\\\\|bbo\" /Users/amanshah/Documents/Hackathons/polyArb/node_modules/polymarket-us/dist/*.d.ts)",
+      "Bash(echo \"exit=$?\")"
     ]
   }
 }

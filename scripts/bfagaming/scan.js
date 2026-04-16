@@ -559,8 +559,8 @@ async function runScan(opts = {}) {
         const { market: mkt, awayPrice: midAway, homePrice: midHome, awayToken, homeToken } = match;
         const volumeUsd = mkt.total_volume_usd ?? 0;
 
-        // Skip low-volume markets (unreliable pricing)
-        if (volumeUsd < 300) {
+        // Skip low-volume markets — unwind ladder needs liquidity to exit cleanly if a leg fails.
+        if (volumeUsd < 1000) {
           console.log(`    ${displayName}${mtTag} → skipped (vol=$${Math.round(volumeUsd)})`);
           continue;
         }

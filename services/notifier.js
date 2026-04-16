@@ -19,6 +19,9 @@ const fs = require('fs');
 const path = require('path');
 const { Resend } = require('resend');
 const { runScan } = require('../scripts/bfagaming/scan');
+const eventLog = require('./eventLog');
+const stats = require('./stats');
+const cooldown = require('./bfaCooldown');
 
 const OUT_DIR = path.join(__dirname, '..', 'outputs', 'bfagaming');
 fs.mkdirSync(OUT_DIR, { recursive: true });
@@ -28,8 +31,10 @@ fs.mkdirSync(OUT_DIR, { recursive: true });
 const PORT              = process.env.PORT || 3001;
 const RESEND_API_KEY    = process.env.RESEND_API_KEY;
 const NOTIFICATION_EMAIL = process.env.NOTIFICATION_EMAIL;
-const ARB_MIN_COST      = 0.95;  // email only when 0.95 <= cost <= 1.000
-const ARB_MAX_COST      = 1.000;
+const ARB_MIN_COST      = 0.95;
+// 1.005 includes near-arbs so email pipeline is exercised before a true 1.000 arb lands.
+// Near-arb in [1.000, 1.005] still has positive netValue once BFA bonus rollover is factored in.
+const ARB_MAX_COST      = 1.005;
 const MIN_INTERVAL_MS   = 4 * 60 * 1000;  // 4 minutes
 const MAX_INTERVAL_MS   = 8 * 60 * 1000;  // 8 minutes
 
@@ -193,6 +198,22 @@ async function tick() {
 
     console.log(`Scan done in ${((Date.now() - start) / 1000).toFixed(1)}s — ${results.length} games, ${arbs.length} arbs, ${newArbs.length} new`);
 
+    eventLog.scan({
+      durationMs: Date.now() - start,
+      gamesChecked: results.length,
+      arbsFound: arbs.length,
+      newArbs: newArbs.length,
+      cooldownActive: cooldown.isInCooldown(),
+    });
+    for (const a of arbs) {
+      eventLog.arbFound({
+        sport: a.sport, awayTeam: a.awayTeam, homeTeam: a.homeTeam,
+        strategy: a.strategy, marketType: a.marketType, line: a.line,
+        bestCost: a.bestCost, profitPct: a.profitPct,
+        bfaBet: a.bfaBet, polyBet: a.polyBet, netValue: a.netValue,
+      });
+    }
+
     if (newArbs.length > 0) {
       await sendArbEmail(newArbs);
       newArbs.forEach(markNotified);
@@ -232,6 +253,7 @@ const server = http.createServer((req, res) => {
       lastScanTime,
       lastScanArbs,
       notifiedCount: notified.size,
+      cooldown: cooldown.status(),
     }));
   } else if (req.url === '/results') {
     res.writeHead(200, { 'Content-Type': 'application/json', ...cors });
@@ -239,6 +261,22 @@ const server = http.createServer((req, res) => {
       lastScanTime,
       results: latestResults,
     }));
+  } else if (req.url === '/stats') {
+    try {
+      res.writeHead(200, { 'Content-Type': 'application/json', ...cors });
+      res.end(JSON.stringify(stats.aggregate()));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json', ...cors });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+  } else if (req.url?.startsWith('/events')) {
+    const u = new URL(req.url, 'http://localhost');
+    const hours = parseInt(u.searchParams.get('hours'), 10) || 24;
+    const typesCsv = u.searchParams.get('types');
+    const since = Date.now() - hours * 60 * 60 * 1000;
+    const events = typesCsv ? eventLog.readTypes(typesCsv.split(','), since) : eventLog.readRange(since);
+    res.writeHead(200, { 'Content-Type': 'application/json', ...cors });
+    res.end(JSON.stringify({ events: events.slice(-500) }));
   } else {
     res.writeHead(404);
     res.end('not found');

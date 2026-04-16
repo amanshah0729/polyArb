@@ -4,6 +4,7 @@ import { Suspense } from 'react';
 import ResultsClient from './ResultsClient';
 import RerunButton from './RerunButton';
 import TabBar from './TabBar';
+import StatsPanel from './StatsPanel';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -728,6 +729,8 @@ async function BetFastContent() {
     return v > 0 ? `+${odds}` : odds;
   }
 
+  const notifierUrl = process.env.NOTIFIER_URL ?? '';
+
   return (
     <>
       <div className="bg-[#1f2937] px-8 py-5 flex items-center justify-between border-b border-[rgba(255,255,255,0.08)]">
@@ -743,6 +746,8 @@ async function BetFastContent() {
           loadingLabel="Scanning..."
         />
       </div>
+
+      {notifierUrl && <StatsPanel notifierUrl={notifierUrl} />}
 
       {emptyMessage ? (
         <EmptyState message={emptyMessage} />
