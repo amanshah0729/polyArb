@@ -11,7 +11,8 @@
  * Concentration cap: bfaAmount ≤ 10% of availableBalance (if provided).
  *
  * Poly quantity derived from BFA dollar exposure:
- *   polyNotional = bfaAmount * (bfaImplied / polyImplied)
+ *   polyNotional = bfaAmount * (polyImplied / bfaImplied)
+ *     — hedges equal payout: W/bfaImplied (BFA wins) == P/polyImplied (Poly wins)
  *   polyQuantity = polyNotional / polyPrice     (in shares)
  * If polyPrice not provided, fall back to polyImplied.
  */
@@ -24,7 +25,7 @@ function tierForCost(bestCost) {
   return null;
 }
 
-function sizeArb({ bestCost, bfaImplied, polyImplied, polyPrice, availableBalance }) {
+function sizeArb({ bestCost, bfaImplied, polyImplied, polyPrice, availableBalance, scaleFactor = 1 }) {
   if (!Number.isFinite(bestCost) || !Number.isFinite(bfaImplied) || !Number.isFinite(polyImplied)) {
     return null;
   }
@@ -33,8 +34,11 @@ function sizeArb({ bestCost, bfaImplied, polyImplied, polyPrice, availableBalanc
   const tier = tierForCost(bestCost);
   if (!tier) return null;
 
-  let bfaAmount = tier.bfaAmount;
-  const rationale = [`tier=${tier.label} ($${tier.bfaAmount} base)`];
+  // Clamp user-chosen scale factor to a safe range
+  const scale = Math.max(0.1, Math.min(3, Number.isFinite(scaleFactor) ? scaleFactor : 1));
+
+  let bfaAmount = tier.bfaAmount * scale;
+  const rationale = [`tier=${tier.label} ($${tier.bfaAmount} base × ${scale.toFixed(2)})`];
 
   if (Number.isFinite(availableBalance) && availableBalance > 0) {
     const cap = Math.floor(availableBalance * 0.10 * 100) / 100;
@@ -45,7 +49,7 @@ function sizeArb({ bestCost, bfaImplied, polyImplied, polyPrice, availableBalanc
   }
 
   const px = Number.isFinite(polyPrice) && polyPrice > 0 ? polyPrice : polyImplied;
-  const polyNotional = bfaAmount * (bfaImplied / polyImplied);
+  const polyNotional = bfaAmount * (polyImplied / bfaImplied);
   const polyQuantity = Math.round((polyNotional / px) * 100) / 100;
 
   return {

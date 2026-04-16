@@ -280,7 +280,7 @@ async function handleExecute(req, res, cors) {
   try { payload = await readJsonBody(req); }
   catch (e) { return json(400, { error: 'bad_body', message: e.message }); }
 
-  const { bfa: bfaIn, poly: polyIn, meta = {} } = payload || {};
+  const { bfa: bfaIn, poly: polyIn, meta = {}, scaleFactor = 1 } = payload || {};
   if (!bfaIn || !polyIn) return json(400, { error: 'missing_bfa_or_poly' });
 
   const requiredBfa = ['eventId', 'fixtureId', 'marketType', 'side', 'contestantId', 'price'];
@@ -307,6 +307,7 @@ async function handleExecute(req, res, cors) {
     bestCost, bfaImplied, polyImplied,
     polyPrice: Number(polyIn.expectedPrice),
     availableBalance: balance,
+    scaleFactor: Number(scaleFactor),
   });
   if (!sized) return json(400, { error: 'cost_out_of_tier', bestCost });
 

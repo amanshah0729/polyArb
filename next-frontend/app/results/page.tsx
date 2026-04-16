@@ -663,12 +663,7 @@ async function BetFastContent() {
   const bfaHomeImpIdx   = idx('BFAGaming Home Implied (%)');
   const polyAwayIdx     = idx('Polymarket Away Implied (%)');
   const polyHomeIdx     = idx('Polymarket Home Implied (%)');
-  const profitIdx       = idx('Profit %');
   const costIdx         = idx('Best Option Cost');
-  const bfaBetIdx       = idx('BFA Bet ($)');
-  const polyBetIdx      = idx('Poly Bet ($)');
-  const pnlIdx          = idx('Guaranteed P&L ($)');
-  const netValIdx       = idx('Net Value ($)');
   const volumeIdx       = idx('Volume ($)');
 
   const sportBadgeClass = (sport: string) => {
@@ -763,7 +758,6 @@ async function BetFastContent() {
             const { side1, side2 } = getSideLabels(row);
             const marketLabel = getMarketLabel(row);
             const cost = row[costIdx] ?? '';
-            const profit = row[profitIdx] ?? '';
             const bfaAwayOdds = row[bfaAwayOddsIdx] ?? '';
             const bfaAwayImp = row[bfaAwayImpIdx] ?? '';
             const bfaHomeOdds = row[bfaHomeOddsIdx] ?? '';
@@ -859,53 +853,8 @@ async function BetFastContent() {
                   </div>
                 )}
 
-                {/* Place Bet (only meaningful when remote provides identifiers) */}
-                <div className="px-4 pb-2">
-                  <PlaceBetButton arb={rawArbs[i]} hasArb={isArb} />
-                </div>
-
-                {/* Bottom stats row */}
-                <div className="flex items-center justify-between px-4 py-3 border-t border-[rgba(255,255,255,0.06)] text-xs">
-                  <div className="flex items-center gap-3">
-                    {profit && (
-                      <span className={`font-mono ${isArb ? 'text-[#22c55e] font-semibold' : 'text-[#9ca3af]'}`}>
-                        {profit}%
-                      </span>
-                    )}
-                    {bfaBetIdx >= 0 && row[bfaBetIdx] && (
-                      <span className="text-[#9ca3af]">
-                        BFA <span className="font-mono text-[#e5e7eb]">${row[bfaBetIdx]}</span>
-                      </span>
-                    )}
-                    {polyBetIdx >= 0 && row[polyBetIdx] && (
-                      <span className="text-[#9ca3af]">
-                        Poly <span className="font-mono text-[#a78bfa]">${row[polyBetIdx]}</span>
-                      </span>
-                    )}
-                  </div>
-                  <div className="flex items-center gap-3">
-                    {pnlIdx >= 0 && row[pnlIdx] && (() => {
-                      const v = parseFloat(row[pnlIdx]);
-                      return (
-                        <span className={`font-mono ${v >= 0 ? 'text-[#22c55e]' : 'text-[#f87171]'}`}>
-                          P&L {v >= 0 ? '+' : ''}${v.toFixed(2)}
-                        </span>
-                      );
-                    })()}
-                    {netValIdx >= 0 && row[netValIdx] && (() => {
-                      const v = parseFloat(row[netValIdx]);
-                      return (
-                        <span className={`font-mono font-semibold px-2 py-0.5 rounded-full ${
-                          v >= 0
-                            ? 'bg-[rgba(34,197,94,0.15)] text-[#22c55e]'
-                            : 'bg-[rgba(239,68,68,0.12)] text-[#f87171]'
-                        }`}>
-                          {v >= 0 ? '+' : ''}${v.toFixed(2)}
-                        </span>
-                      );
-                    })()}
-                  </div>
-                </div>
+                {/* Slider + Place Bet + live stats row (all consolidated) */}
+                <PlaceBetButton arb={rawArbs[i]} hasArb={isArb} />
               </div>
             );
           })}

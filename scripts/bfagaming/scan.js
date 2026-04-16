@@ -645,6 +645,8 @@ async function runScan(opts = {}) {
           // Structured identifiers for one-click Place Bet via executeArb()
           bfaSide: arb.bfaSide,    // 'away' | 'home'
           polySide: arb.polySide,  // 'away' | 'home'
+          bfaImplied: arb.bfaImplied,    // implied prob of the chosen BFA side
+          polyImplied: arb.polyImplied,  // implied prob of the chosen Poly side
           bfaEventId: bfaEntry.bfaEventId,
           bfaFixtureId: bfaEntry.bfaFixtureId,
           bfaMarketTypeInt: bfaEntry.bfaMarketTypeInt,
