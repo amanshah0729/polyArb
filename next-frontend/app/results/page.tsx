@@ -5,6 +5,7 @@ import ResultsClient from './ResultsClient';
 import RerunButton from './RerunButton';
 import TabBar from './TabBar';
 import StatsPanel from './StatsPanel';
+import PlaceBetButton, { type ArbPayload } from './PlaceBetButton';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -627,6 +628,7 @@ async function BetFastContent() {
   let headers: string[] = [];
   let lastPulledTimestamp: Date | null = null;
   let emptyMessage: string | null = null;
+  let rawArbs: (ArbPayload | null)[] = [];
 
   // Try remote notifier first, fall back to local CSV
   const remote = await fetchRemoteResults();
@@ -634,6 +636,7 @@ async function BetFastContent() {
     const parsed = resultsToRows(remote.results);
     headers = parsed.headers;
     rows = parsed.rows;
+    rawArbs = remote.results.map((r: ArbPayload) => r);
     lastPulledTimestamp = remote.lastScanTime ? new Date(remote.lastScanTime) : null;
   } else {
     const local = readLocalCSV();
@@ -641,6 +644,7 @@ async function BetFastContent() {
     rows = local.rows;
     lastPulledTimestamp = local.lastPulledTimestamp;
     emptyMessage = local.emptyMessage;
+    rawArbs = new Array(rows.length).fill(null);
   }
 
   const idx = (name: string) => headers.indexOf(name);
@@ -854,6 +858,11 @@ async function BetFastContent() {
                     {renderStrategy(row[strategyIdx])}
                   </div>
                 )}
+
+                {/* Place Bet (only meaningful when remote provides identifiers) */}
+                <div className="px-4 pb-2">
+                  <PlaceBetButton arb={rawArbs[i]} hasArb={isArb} />
+                </div>
 
                 {/* Bottom stats row */}
                 <div className="flex items-center justify-between px-4 py-3 border-t border-[rgba(255,255,255,0.06)] text-xs">

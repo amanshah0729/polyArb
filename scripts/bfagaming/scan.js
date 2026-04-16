@@ -108,12 +108,15 @@ async function fetchBFAGames(slug) {
       const homeL = home.name.toLowerCase();
       if (awayL.includes('away') && homeL.includes('home')) continue;
 
+      const fixture = game.fixtures[0];
       const base = {
         name: game.name,
-        startDate: game.startDate ?? game.fixtures[0]?.date ?? null,
+        startDate: game.startDate ?? fixture?.date ?? null,
         status: game.status ?? 'Upcoming',
         awayTeam: away.name,
         homeTeam: home.name,
+        bfaEventId: game.id,
+        bfaFixtureId: fixture?.id ?? null,
       };
 
       for (const mkt of game.markets) {
@@ -129,6 +132,15 @@ async function fetchBFAGames(slug) {
             awayOdds: awayOddsObj.price, homeOdds: homeOddsObj.price,
             awayImplied: americanToImplied(awayOddsObj.price),
             homeImplied: americanToImplied(homeOddsObj.price),
+            bfaMarketTypeInt: mkt.type,
+            bfaPeriodNumber: mkt.periodNumber ?? 0,
+            bfaAwaySide: awayOddsObj.side, bfaHomeSide: homeOddsObj.side,
+            bfaAwayContestantId: awayOddsObj.contestantId ?? away.id,
+            bfaHomeContestantId: homeOddsObj.contestantId ?? home.id,
+            bfaAwayIndex: awayOddsObj.index ?? 0,
+            bfaHomeIndex: homeOddsObj.index ?? 0,
+            bfaAwayLine: awayOddsObj.line ?? 0,
+            bfaHomeLine: homeOddsObj.line ?? 0,
           });
         } else if (marketType === 'spread') {
           const awayOddsObj = mkt.odds.find((o) => o.side === 2);
@@ -139,6 +151,15 @@ async function fetchBFAGames(slug) {
             awayOdds: awayOddsObj.price, homeOdds: homeOddsObj.price,
             awayImplied: americanToImplied(awayOddsObj.price),
             homeImplied: americanToImplied(homeOddsObj.price),
+            bfaMarketTypeInt: mkt.type,
+            bfaPeriodNumber: mkt.periodNumber ?? 0,
+            bfaAwaySide: awayOddsObj.side, bfaHomeSide: homeOddsObj.side,
+            bfaAwayContestantId: awayOddsObj.contestantId ?? away.id,
+            bfaHomeContestantId: homeOddsObj.contestantId ?? home.id,
+            bfaAwayIndex: awayOddsObj.index ?? 0,
+            bfaHomeIndex: homeOddsObj.index ?? 0,
+            bfaAwayLine: awayOddsObj.line ?? 0,
+            bfaHomeLine: homeOddsObj.line ?? 0,
           });
         } else if (marketType === 'total') {
           const overObj = mkt.odds.find((o) => o.side === 4);
@@ -151,6 +172,15 @@ async function fetchBFAGames(slug) {
             homeImplied: americanToImplied(underObj.price),
             awayTeam: 'Over', homeTeam: 'Under',
             _realAway: away.name, _realHome: home.name,
+            bfaMarketTypeInt: mkt.type,
+            bfaPeriodNumber: mkt.periodNumber ?? 0,
+            bfaAwaySide: overObj.side, bfaHomeSide: underObj.side,
+            bfaAwayContestantId: overObj.contestantId ?? 0,
+            bfaHomeContestantId: underObj.contestantId ?? 0,
+            bfaAwayIndex: overObj.index ?? 0,
+            bfaHomeIndex: underObj.index ?? 0,
+            bfaAwayLine: overObj.line ?? 0,
+            bfaHomeLine: underObj.line ?? 0,
           });
         }
       }
@@ -288,10 +318,10 @@ function matchPredexonMarket(bfaEntry, predexonMarkets, sportSlug) {
 
       // Determine which outcome is away vs home
       if (awayInL0) {
-        return { market: mkt, awayPrice: p0, homePrice: p1, awayToken: t0, homeToken: t1, swapped: false };
+        return { market: mkt, marketSlug: mkt.market_slug, awayPrice: p0, homePrice: p1, awayToken: t0, homeToken: t1, swapped: false };
       }
       if (homeInL0) {
-        return { market: mkt, awayPrice: p1, homePrice: p0, awayToken: t1, homeToken: t0, swapped: true };
+        return { market: mkt, marketSlug: mkt.market_slug, awayPrice: p1, homePrice: p0, awayToken: t1, homeToken: t0, swapped: true };
       }
 
     } else if (mt === 'total') {
@@ -310,10 +340,10 @@ function matchPredexonMarket(bfaEntry, predexonMarkets, sportSlug) {
 
       // Outcomes should be Over/Under
       if (l0 === 'over') {
-        return { market: mkt, awayPrice: p0, homePrice: p1, awayToken: t0, homeToken: t1, swapped: false };
+        return { market: mkt, marketSlug: mkt.market_slug, awayPrice: p0, homePrice: p1, awayToken: t0, homeToken: t1, swapped: false };
       }
       if (l0 === 'under') {
-        return { market: mkt, awayPrice: p1, homePrice: p0, awayToken: t1, homeToken: t0, swapped: true };
+        return { market: mkt, marketSlug: mkt.market_slug, awayPrice: p1, homePrice: p0, awayToken: t1, homeToken: t0, swapped: true };
       }
 
     } else if (mt === 'spread') {
@@ -334,10 +364,10 @@ function matchPredexonMarket(bfaEntry, predexonMarkets, sportSlug) {
       if (!(allText.includes(awayNorm) || awayNorm.includes(l0) || awayNorm.includes(l1))) continue;
       if (!(allText.includes(homeNorm) || homeNorm.includes(l0) || homeNorm.includes(l1))) continue;
       if (l0.includes(awayNorm) || awayNorm.includes(l0)) {
-        return { market: mkt, awayPrice: p0, homePrice: p1, awayToken: t0, homeToken: t1, swapped: false };
+        return { market: mkt, marketSlug: mkt.market_slug, awayPrice: p0, homePrice: p1, awayToken: t0, homeToken: t1, swapped: false };
       }
       if (l0.includes(homeNorm) || homeNorm.includes(l0)) {
-        return { market: mkt, awayPrice: p1, homePrice: p0, awayToken: t1, homeToken: t0, swapped: true };
+        return { market: mkt, marketSlug: mkt.market_slug, awayPrice: p1, homePrice: p0, awayToken: t1, homeToken: t0, swapped: true };
       }
     }
   }
@@ -476,18 +506,22 @@ function checkArb(bfaEntry, polyPrices) {
   const lineTag = bfaEntry.line != null ? ` (${bfaEntry.line})` : '';
   const mtLabel = mt !== 'moneyline' ? ` [${mt}${lineTag}]` : '';
 
-  let strategy, bfaImplied, polyImplied;
+  let strategy, bfaImplied, polyImplied, bfaSide, polySide;
   if (option1 <= option2) {
     strategy = `${bfaEntry.awayTeam}@BFA + ${bfaEntry.homeTeam}@Poly${mtLabel}`;
     bfaImplied = bfaAway;
     polyImplied = polyHome;
+    bfaSide = 'away';
+    polySide = 'home';
   } else {
     strategy = `${bfaEntry.awayTeam}@Poly + ${bfaEntry.homeTeam}@BFA${mtLabel}`;
     bfaImplied = bfaHome;
     polyImplied = polyAway;
+    bfaSide = 'home';
+    polySide = 'away';
   }
 
-  return { hasArb, bestCost, profitPct, strategy, bfaImplied, polyImplied };
+  return { hasArb, bestCost, profitPct, strategy, bfaImplied, polyImplied, bfaSide, polySide };
 }
 
 // ── Main scan function ────────────────────────────────────────────────────────
@@ -556,7 +590,7 @@ async function runScan(opts = {}) {
           continue;
         }
 
-        const { market: mkt, awayPrice: midAway, homePrice: midHome, awayToken, homeToken } = match;
+        const { market: mkt, marketSlug: polyMarketSlug, awayPrice: midAway, homePrice: midHome, awayToken, homeToken, swapped: polySwapped } = match;
         const volumeUsd = mkt.total_volume_usd ?? 0;
 
         // Skip low-volume markets — unwind ladder needs liquidity to exit cleanly if a leg fails.
@@ -607,6 +641,33 @@ async function runScan(opts = {}) {
           guaranteedPnl: sized.guaranteedPnl,
           netValue: sized.netValue,
           volumeUsd,
+
+          // Structured identifiers for one-click Place Bet via executeArb()
+          bfaSide: arb.bfaSide,    // 'away' | 'home'
+          polySide: arb.polySide,  // 'away' | 'home'
+          bfaEventId: bfaEntry.bfaEventId,
+          bfaFixtureId: bfaEntry.bfaFixtureId,
+          bfaMarketTypeInt: bfaEntry.bfaMarketTypeInt,
+          bfaPeriodNumber: bfaEntry.bfaPeriodNumber,
+          bfaAwaySide: bfaEntry.bfaAwaySide,
+          bfaHomeSide: bfaEntry.bfaHomeSide,
+          bfaAwayContestantId: bfaEntry.bfaAwayContestantId,
+          bfaHomeContestantId: bfaEntry.bfaHomeContestantId,
+          bfaAwayIndex: bfaEntry.bfaAwayIndex,
+          bfaHomeIndex: bfaEntry.bfaHomeIndex,
+          bfaAwayLine: bfaEntry.bfaAwayLine,
+          bfaHomeLine: bfaEntry.bfaHomeLine,
+          bfaAwayPrice: bfaEntry.awayOdds,
+          bfaHomePrice: bfaEntry.homeOdds,
+          polyMarketSlug,
+          polyAwayToken: awayToken,
+          polyHomeToken: homeToken,
+          polyAwayPrice: polyPrices.awayImplied,
+          polyHomePrice: polyPrices.homeImplied,
+          // polymarket-us uses LONG (YES = outcome[0]) / SHORT (NO = outcome[1]) intents.
+          // swapped=false → away is outcome[0] (LONG); swapped=true → away is outcome[1] (SHORT).
+          polyAwayIntent: polySwapped ? 'ORDER_INTENT_BUY_SHORT' : 'ORDER_INTENT_BUY_LONG',
+          polyHomeIntent: polySwapped ? 'ORDER_INTENT_BUY_LONG'  : 'ORDER_INTENT_BUY_SHORT',
         });
       }
     }

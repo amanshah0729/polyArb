@@ -22,6 +22,9 @@ const { runScan } = require('../scripts/bfagaming/scan');
 const eventLog = require('./eventLog');
 const stats = require('./stats');
 const cooldown = require('./bfaCooldown');
+const { executeArb } = require('./arbExecutor');
+const { sizeArb } = require('./betSizing');
+const { getBalance } = require('../scripts/bfagaming/placeBet');
 
 const OUT_DIR = path.join(__dirname, '..', 'outputs', 'bfagaming');
 fs.mkdirSync(OUT_DIR, { recursive: true });
@@ -31,6 +34,9 @@ fs.mkdirSync(OUT_DIR, { recursive: true });
 const PORT              = process.env.PORT || 3001;
 const RESEND_API_KEY    = process.env.RESEND_API_KEY;
 const NOTIFICATION_EMAIL = process.env.NOTIFICATION_EMAIL;
+const EXECUTION_ENABLED  = process.env.EXECUTION_ENABLED === 'true';
+const EXECUTION_TOKEN    = process.env.EXECUTION_TOKEN || '';
+const MAX_LEG_NOTIONAL   = 200;
 const ARB_MIN_COST      = 0.95;
 // 1.005 includes near-arbs so email pipeline is exercised before a true 1.000 arb lands.
 // Near-arb in [1.000, 1.005] still has positive netValue once BFA bonus rollover is factored in.
@@ -239,11 +245,120 @@ function scheduleNext() {
 
 // ── Health server ─────────────────────────────────────────────────────────────
 
-const server = http.createServer((req, res) => {
+function readJsonBody(req, maxBytes = 32 * 1024) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > maxBytes) { reject(new Error('body too large')); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      try {
+        const text = Buffer.concat(chunks).toString('utf8') || '{}';
+        resolve(JSON.parse(text));
+      } catch (e) { reject(e); }
+    });
+    req.on('error', reject);
+  });
+}
+
+async function handleExecute(req, res, cors) {
+  const json = (code, body) => {
+    res.writeHead(code, { 'Content-Type': 'application/json', ...cors });
+    res.end(JSON.stringify(body));
+  };
+
+  if (!EXECUTION_ENABLED) return json(503, { error: 'execution_disabled', hint: 'Set EXECUTION_ENABLED=true on the notifier' });
+
+  const authHeader = req.headers['authorization'] || '';
+  const provided = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+  if (!EXECUTION_TOKEN || provided !== EXECUTION_TOKEN) return json(401, { error: 'unauthorized' });
+
+  let payload;
+  try { payload = await readJsonBody(req); }
+  catch (e) { return json(400, { error: 'bad_body', message: e.message }); }
+
+  const { bfa: bfaIn, poly: polyIn, meta = {} } = payload || {};
+  if (!bfaIn || !polyIn) return json(400, { error: 'missing_bfa_or_poly' });
+
+  const requiredBfa = ['eventId', 'fixtureId', 'marketType', 'side', 'contestantId', 'price'];
+  for (const k of requiredBfa) if (bfaIn[k] == null) return json(400, { error: `missing_bfa_field:${k}` });
+  const requiredPoly = ['marketSlug', 'intent', 'expectedPrice'];
+  for (const k of requiredPoly) if (polyIn[k] == null) return json(400, { error: `missing_poly_field:${k}` });
+
+  if (cooldown.isInCooldown()) {
+    return json(409, { error: 'bfa_cooldown', cooldown: cooldown.status() });
+  }
+
+  let balance = null;
+  try {
+    const bal = await getBalance();
+    balance = Number(bal?.availableBalance ?? 0);
+  } catch (e) {
+    return json(502, { error: 'balance_fetch_failed', message: e.message });
+  }
+
+  const bestCost = Number(meta.bestCost);
+  const bfaImplied = Number(meta.bfaImplied);
+  const polyImplied = Number(meta.polyImplied);
+  const sized = sizeArb({
+    bestCost, bfaImplied, polyImplied,
+    polyPrice: Number(polyIn.expectedPrice),
+    availableBalance: balance,
+  });
+  if (!sized) return json(400, { error: 'cost_out_of_tier', bestCost });
+
+  if (sized.bfaAmount > MAX_LEG_NOTIONAL) return json(400, { error: 'bfa_leg_too_large', bfaAmount: sized.bfaAmount });
+  const polyNotional = sized.polyQuantity * Number(polyIn.expectedPrice);
+  if (polyNotional > MAX_LEG_NOTIONAL) return json(400, { error: 'poly_leg_too_large', polyNotional });
+
+  const bfa = {
+    eventId: bfaIn.eventId,
+    fixtureId: bfaIn.fixtureId,
+    marketType: bfaIn.marketType,
+    periodNumber: bfaIn.periodNumber ?? 0,
+    side: bfaIn.side,
+    index: bfaIn.index ?? 0,
+    contestantId: bfaIn.contestantId,
+    line: bfaIn.line ?? 0,
+    price: Number(bfaIn.price),
+    amount: sized.bfaAmount,
+    isLive: !!bfaIn.isLive,
+  };
+  const poly = {
+    marketSlug: polyIn.marketSlug,
+    intent: polyIn.intent,
+    expectedPrice: Number(polyIn.expectedPrice),
+    quantity: sized.polyQuantity,
+  };
+
+  try {
+    const result = await executeArb({ bfa, poly, meta: { ...meta, sizing: sized, availableBalance: balance } });
+    return json(200, { ok: true, sizing: sized, result });
+  } catch (e) {
+    console.error('executeArb threw:', e);
+    return json(500, { error: 'execute_threw', message: e.message });
+  }
+}
+
+const server = http.createServer(async (req, res) => {
   const cors = {
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'content-type, authorization',
   };
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, cors);
+    res.end();
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/execute') {
+    return handleExecute(req, res, cors);
+  }
 
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'Content-Type': 'application/json', ...cors });
@@ -254,6 +369,7 @@ const server = http.createServer((req, res) => {
       lastScanArbs,
       notifiedCount: notified.size,
       cooldown: cooldown.status(),
+      executionEnabled: EXECUTION_ENABLED,
     }));
   } else if (req.url === '/results') {
     res.writeHead(200, { 'Content-Type': 'application/json', ...cors });
@@ -287,6 +403,7 @@ server.listen(PORT, () => {
   console.log(`Notifier health server on :${PORT}`);
   console.log(`Threshold: ${ARB_MIN_COST.toFixed(3)} ≤ cost ≤ ${ARB_MAX_COST.toFixed(3)}`);
   console.log(`Email: ${NOTIFICATION_EMAIL.replace(/(.{3}).*(@.*)/, '$1***$2')}`);
+  console.log(`Execution: ${EXECUTION_ENABLED ? 'ENABLED' : 'disabled'} (token ${EXECUTION_TOKEN ? 'set' : 'MISSING'})`);
   console.log('Starting first scan...\n');
   tick();
 });
