@@ -54,12 +54,18 @@ async function newContext() {
 
   // Inject cached OIDC user into sessionStorage before any page script runs — Blazor SPA reads
   // sessionStorage[oidc.user:...] to decide logged-in state. storageState doesn't persist sessionStorage.
+  // Only inject if the cached token is still fresh — injecting a stale token causes the SPA to believe
+  // it's logged in and skip processing the Keycloak callback after a fresh login, leaving us with a dead token.
   if (fs.existsSync(OIDC_PATH)) {
     try {
       const oidcJson = fs.readFileSync(OIDC_PATH, 'utf8');
-      await context.addInitScript(({ key, value }) => {
-        try { sessionStorage.setItem(key, value); } catch {}
-      }, { key: OIDC_KEY, value: oidcJson });
+      const parsed = JSON.parse(oidcJson);
+      const fresh = parsed && parsed.access_token && parsed.expires_at && (parsed.expires_at * 1000) > Date.now() + 30000;
+      if (fresh) {
+        await context.addInitScript(({ key, value }) => {
+          try { sessionStorage.setItem(key, value); } catch {}
+        }, { key: OIDC_KEY, value: oidcJson });
+      }
     } catch {}
   }
   return context;
@@ -78,13 +84,20 @@ async function login(context) {
   const user = need('BFA_USERNAME');
   const pass = need('BFA_PASSWORD');
 
-  await page.goto(SITE, { waitUntil: 'networkidle', timeout: 60000 });
+  // Clear cached oidc user + cookies so the SPA renders the logged-out state and exposes the Log In button.
+  // Stale access_token in sessionStorage would otherwise make the SPA display as "logged in" even though the server rejected it.
+  await context.clearCookies().catch(() => {});
+  await page.goto(SITE, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.evaluate(() => { try { sessionStorage.clear(); localStorage.clear(); } catch {} });
+  await page.reload({ waitUntil: 'networkidle', timeout: 60000 });
+
   const loginBtn = page.locator('button:has-text("Log In"), button:has-text("Login")').first();
   await loginBtn.waitFor({ timeout: 30000 });
-  await loginBtn.click();
+  // MudBlazor snackbar can intercept pointer events even with force:true — dispatch click via JS
+  await loginBtn.evaluate((el) => (el).click());
 
-  await page.waitForURL(/auth\.bfagaming\.com/, { timeout: 30000 });
-  await page.locator('#username, input[name="username"]').first().waitFor({ timeout: 20000 });
+  await page.waitForURL(/auth\.bfagaming\.com/, { timeout: 60000, waitUntil: 'domcontentloaded' });
+  await page.locator('#username, input[name="username"]').first().waitFor({ timeout: 30000 });
   await page.locator('#username, input[name="username"]').first().fill(user);
   await page.locator('#password, input[name="password"]').first().fill(pass);
   await page.locator('#kc-login, button[type="submit"], input[type="submit"]').first().click();
@@ -131,15 +144,17 @@ async function getAccessToken({ force = false } = {}) {
   // Try to extract token from an existing session (storageState restores cookies/localStorage but not sessionStorage;
   // visiting the site will re-populate oidc.user via silent sign-in if KEYCLOAK_SESSION cookies are still valid).
   const page = await ctx.newPage();
+  const isFresh = (o) => o && o.access_token && o.expires_at && (o.expires_at * 1000) > Date.now() + 30000;
   try {
     await page.goto(SITE, { waitUntil: 'networkidle', timeout: 60000 });
     let oidc = await extractTokenFromPage(page);
+    // Wait for SPA to silently refresh if the injected token is stale (refresh_token exchange)
     const deadline = Date.now() + 15000;
-    while ((!oidc || !oidc.access_token) && Date.now() < deadline) {
+    while (!isFresh(oidc) && Date.now() < deadline) {
       await page.waitForTimeout(1000);
       oidc = await extractTokenFromPage(page);
     }
-    if (oidc && oidc.access_token) {
+    if (isFresh(oidc)) {
       _tokenCache = oidcToToken(oidc);
       saveDiskToken(_tokenCache);
       try { fs.writeFileSync(OIDC_PATH, JSON.stringify(oidc)); } catch {}

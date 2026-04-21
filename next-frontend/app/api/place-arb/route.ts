@@ -3,7 +3,7 @@ import { NextRequest, NextResponse } from 'next/server';
 export const runtime = 'nodejs';
 
 export async function POST(req: NextRequest) {
-  const notifierUrl = process.env.NOTIFIER_URL;
+  const notifierUrl = process.env.NOTIFIER_URL?.trim();
   const token = process.env.EXECUTION_TOKEN;
 
   if (!notifierUrl) return NextResponse.json({ error: 'NOTIFIER_URL not configured' }, { status: 500 });

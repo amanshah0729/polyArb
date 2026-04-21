@@ -286,6 +286,17 @@ function matchPredexonMarket(bfaEntry, predexonMarkets, sportSlug) {
     const l0 = (o0.label ?? '').toLowerCase();
     const l1 = (o1.label ?? '').toLowerCase();
 
+    // Series vs single-game guard: a series-winner market must not match a single-game BFA
+    // entry (or vice versa). Poly series slugs/titles contain "series", "advance", "win-the",
+    // "round-1", etc. BFA series events have "Series" or "series" in game.name.
+    const seriesRe = /\b(series|advance|win.the|playoff.winner|round.\d)\b/i;
+    const polyIsSeries = seriesRe.test(slug) || seriesRe.test(title);
+    const bfaIsSeries = seriesRe.test(bfaEntry.name ?? '');
+    if (polyIsSeries !== bfaIsSeries) {
+      console.log(`    ⚠ Series/game mismatch: BFA "${bfaEntry.name}" (${bfaIsSeries ? 'series' : 'game'}) vs Poly "${slug}" (${polyIsSeries ? 'series' : 'game'}) — skipping`);
+      continue;
+    }
+
     if (mt === 'moneyline') {
       // Slug should NOT contain 'total' or 'spread'
       if (slug.includes('total') || slug.includes('spread') || slug.includes('o-u') || slug.includes('pt')) continue;
@@ -363,10 +374,36 @@ function matchPredexonMarket(bfaEntry, predexonMarkets, sportSlug) {
       const allText = `${l0} ${l1} ${title}`;
       if (!(allText.includes(awayNorm) || awayNorm.includes(l0) || awayNorm.includes(l1))) continue;
       if (!(allText.includes(homeNorm) || homeNorm.includes(l0) || homeNorm.includes(l1))) continue;
+
+      // Extract signed line from Poly outcome labels to verify spread direction matches BFA.
+      // Poly labels look like "phillies -1.5" or "cubs +1.5". BFA stores bfaAwayLine/bfaHomeLine
+      // with signs (e.g. away=+1.5, home=-1.5). Both platforms must agree on which team is favored.
+      const polyLineRe = /([+-])\s*(\d+(?:\.\d+)?)\s*$/;
+      const l0Match = l0.match(polyLineRe);
+      const l1Match = l1.match(polyLineRe);
+
       if (l0.includes(awayNorm) || awayNorm.includes(l0)) {
+        // l0 is the away team — check that the Poly sign matches BFA's away line sign
+        if (l0Match) {
+          const polyAwaySign = l0Match[1] === '-' ? -1 : 1;
+          const bfaAwaySign = bfaEntry.bfaAwayLine < 0 ? -1 : 1;
+          if (polyAwaySign !== bfaAwaySign) {
+            console.log(`    ⚠ Spread direction mismatch: BFA away=${bfaEntry.bfaAwayLine}, Poly l0="${l0}" — skipping ${slug}`);
+            continue;
+          }
+        }
         return { market: mkt, marketSlug: mkt.market_slug, awayPrice: p0, homePrice: p1, awayToken: t0, homeToken: t1, swapped: false };
       }
       if (l0.includes(homeNorm) || homeNorm.includes(l0)) {
+        // l0 is the home team — check that the Poly sign matches BFA's home line sign
+        if (l0Match) {
+          const polyHomeSign = l0Match[1] === '-' ? -1 : 1;
+          const bfaHomeSign = bfaEntry.bfaHomeLine < 0 ? -1 : 1;
+          if (polyHomeSign !== bfaHomeSign) {
+            console.log(`    ⚠ Spread direction mismatch: BFA home=${bfaEntry.bfaHomeLine}, Poly l0="${l0}" — skipping ${slug}`);
+            continue;
+          }
+        }
         return { market: mkt, marketSlug: mkt.market_slug, awayPrice: p1, homePrice: p0, awayToken: t1, homeToken: t0, swapped: true };
       }
     }

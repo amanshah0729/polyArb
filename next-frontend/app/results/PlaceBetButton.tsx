@@ -46,6 +46,7 @@ type State =
   | { kind: 'error'; message: string };
 
 // Mirror of server-side tier logic in services/betSizing.js. Keep in sync.
+const BFA_MIN_BET = 5;
 function tierForCost(cost: number): { bfaAmount: number; label: string } | null {
   if (cost <= 0.995) return { bfaAmount: 50, label: 'deep-arb' };
   if (cost <= 1.000) return { bfaAmount: 30, label: 'true-arb' };
@@ -140,6 +141,10 @@ export default function PlaceBetButton({ arb, hasArb }: { arb: ArbPayload | null
   const [scale, setScale] = useState(1.0);
 
   const preview: Preview | null = useMemo(() => (arb ? previewSize(arb, scale) : null), [arb, scale]);
+
+  // Minimum scale so scaled BFA bet stays ≥ BFA_MIN_BET (floor 0.1 regardless)
+  const tierBase = arb?.bestCost != null ? tierForCost(arb.bestCost)?.bfaAmount ?? 0 : 0;
+  const minScale = tierBase > 0 ? Math.max(0.1, Math.ceil((BFA_MIN_BET / tierBase) * 100) / 100) : 0.1;
 
   if (!arb) {
     return (
@@ -283,10 +288,10 @@ export default function PlaceBetButton({ arb, hasArb }: { arb: ArbPayload | null
           <span className="font-mono w-10 text-right">{scale.toFixed(2)}×</span>
           <input
             type="range"
-            min={0.1}
+            min={minScale}
             max={3}
             step={0.05}
-            value={scale}
+            value={Math.max(scale, minScale)}
             onChange={(e) => setScale(parseFloat(e.target.value))}
             disabled={tierMissing}
             className="flex-1 accent-[#22c55e]"

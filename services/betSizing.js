@@ -25,6 +25,8 @@ function tierForCost(bestCost) {
   return null;
 }
 
+const BFA_MIN_BET = 5;
+
 function sizeArb({ bestCost, bfaImplied, polyImplied, polyPrice, availableBalance, scaleFactor = 1 }) {
   if (!Number.isFinite(bestCost) || !Number.isFinite(bfaImplied) || !Number.isFinite(polyImplied)) {
     return null;
@@ -48,6 +50,9 @@ function sizeArb({ bestCost, bfaImplied, polyImplied, polyPrice, availableBalanc
     }
   }
 
+  // BFA rejects bets below $5 (risk/win minimum) — refuse rather than place a bet that'll fail
+  if (bfaAmount < BFA_MIN_BET) return null;
+
   const px = Number.isFinite(polyPrice) && polyPrice > 0 ? polyPrice : polyImplied;
   const polyNotional = bfaAmount * (polyImplied / bfaImplied);
   const polyQuantity = Math.round((polyNotional / px) * 100) / 100;
@@ -62,4 +67,4 @@ function sizeArb({ bestCost, bfaImplied, polyImplied, polyPrice, availableBalanc
   };
 }
 
-module.exports = { sizeArb, tierForCost };
+module.exports = { sizeArb, tierForCost, BFA_MIN_BET };

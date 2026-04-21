@@ -38,9 +38,7 @@ const EXECUTION_ENABLED  = process.env.EXECUTION_ENABLED === 'true';
 const EXECUTION_TOKEN    = process.env.EXECUTION_TOKEN || '';
 const MAX_LEG_NOTIONAL   = 200;
 const ARB_MIN_COST      = 0.95;
-// 1.005 includes near-arbs so email pipeline is exercised before a true 1.000 arb lands.
-// Near-arb in [1.000, 1.005] still has positive netValue once BFA bonus rollover is factored in.
-const ARB_MAX_COST      = 1.005;
+const ARB_MAX_COST      = 1.000;
 const MIN_INTERVAL_MS   = 4 * 60 * 1000;  // 4 minutes
 const MAX_INTERVAL_MS   = 8 * 60 * 1000;  // 8 minutes
 
@@ -309,7 +307,11 @@ async function handleExecute(req, res, cors) {
     availableBalance: balance,
     scaleFactor: Number(scaleFactor),
   });
-  if (!sized) return json(400, { error: 'cost_out_of_tier', bestCost });
+  if (!sized) {
+    const tier = require('./betSizing').tierForCost(bestCost);
+    if (!tier) return json(400, { error: 'cost_out_of_tier', bestCost });
+    return json(400, { error: 'below_bfa_minimum', hint: 'scaled BFA bet < $5 (BFA min) — raise scale or check balance', bestCost, balance });
+  }
 
   if (sized.bfaAmount > MAX_LEG_NOTIONAL) return json(400, { error: 'bfa_leg_too_large', bfaAmount: sized.bfaAmount });
   const polyNotional = sized.polyQuantity * Number(polyIn.expectedPrice);
