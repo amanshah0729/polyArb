@@ -42,6 +42,21 @@ const BFA_MIN_TOWIN = 5;
 
 const LOG_DIR = path.join(__dirname, '..', 'priv', 'maker-shadow');
 
+// Auto-stop: the experiment runs for a bounded window, then goes dormant so it can't
+// collect data forever. Past the window the notifier emails the summary once and stops
+// calling tick(). Override the end with SHADOW_WINDOW_END (ISO). Default ~7 days.
+const WINDOW_END_ISO = process.env.SHADOW_WINDOW_END || '2026-07-10T23:59:59-05:00';
+const DONE_FLAG = path.join(LOG_DIR, 'window-ended.flag');
+
+function isActive() {
+  const t = Date.parse(WINDOW_END_ISO);
+  return !Number.isFinite(t) || Date.now() < t;
+}
+function hasFinalized() { try { return fs.existsSync(DONE_FLAG); } catch { return false; } }
+function markFinalized() {
+  try { fs.mkdirSync(LOG_DIR, { recursive: true }); fs.writeFileSync(DONE_FLAG, new Date().toISOString()); } catch { /* noop */ }
+}
+
 // In-memory open observations (this process): key → obs. Persisted opens are in the
 // log too, but outcomes are only computed for orders opened in the current process.
 const open = new Map();
@@ -101,6 +116,7 @@ function bfaSizing(b) {
  * any error is swallowed so it can never break the notifier's scan loop.
  */
 async function tick(results, polyTrader) {
+  if (!isActive()) return; // experiment window closed — go dormant
   const now = Date.now();
 
   // 1) Reconcile open observations.
@@ -254,4 +270,4 @@ function summary(sinceMs = Date.now() - 7 * 24 * 60 * 60 * 1000) {
   };
 }
 
-module.exports = { tick, summary, readLog, keyFor, LOG_DIR };
+module.exports = { tick, summary, readLog, keyFor, LOG_DIR, isActive, hasFinalized, markFinalized, WINDOW_END_ISO };

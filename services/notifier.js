@@ -154,6 +154,43 @@ async function sendArbEmail(arbs) {
   }
 }
 
+// ── Maker shadow experiment: end-of-window summary email ───────────────────────
+// Fires once when the shadow window closes so the experiment can't run unnoticed
+// forever — you get the verdict in your inbox and logging stops.
+
+async function sendShadowSummaryEmail(s) {
+  const pct = (x) => (x == null ? 'n/a' : `${(x * 100).toFixed(0)}%`);
+  const body = [
+    'The maker-rebate viability experiment (Phase 1 shadow) has ended. Results:',
+    '',
+    `  Observations logged:     ${s.observations}`,
+    `  Maker-room rate:         ${pct(s.makerRoomRate)}   (how often a profitable inside bid even exists)`,
+    `  Orders watched to close: ${s.watched}`,
+    `  Would-have-filled:       ${s.filled}  (fill rate ${pct(s.fillRate)})`,
+    `  Arb survived at fill:    ${pct(s.arbSurvivalRate)}   (of fills, still profitable after BFA drift)`,
+    `  Net hit rate:            ${pct(s.netHitRate)}   ← the verdict (watched → filled AND profitable)`,
+    `  Median time-to-fill:     ${s.medianTimeToFillMinutes == null ? 'n/a' : s.medianTimeToFillMinutes + ' min'}`,
+    `  Avg BFA drift at fill:   ${s.avgBfaDriftAtFill == null ? 'n/a' : s.avgBfaDriftAtFill.toFixed(4)}`,
+    `  Avg realized $/share:    ${s.avgRealizedProfitPerShare == null ? 'n/a' : '$' + s.avgRealizedProfitPerShare.toFixed(4)}`,
+    '',
+    'Read: high net-hit-rate + positive $/share ⇒ maker is viable, proceed to Phase 2.',
+    'Near-zero fills or negative $/share ⇒ maker not viable here.',
+    'Shadow logging has now stopped. The notifier keeps scanning/emailing arbs as usual.',
+  ].join('\n');
+  try {
+    const { error } = await resend.emails.send({
+      from: 'polyArb <onboarding@resend.dev>',
+      to: [NOTIFICATION_EMAIL],
+      subject: 'Maker shadow experiment ended — results',
+      text: body,
+    });
+    if (error) console.error('Shadow summary email error:', error);
+    else console.log('  ✉ Maker shadow summary emailed.');
+  } catch (err) {
+    console.error('Shadow summary email failed:', err.message);
+  }
+}
+
 // ── CSV output (for dashboard) ────────────────────────────────────────────────
 
 function writeCSV(results) {
@@ -258,9 +295,16 @@ async function tick() {
     }
 
     // Phase 1 maker-fill shadow experiment — logs only, places no orders.
-    // Defensive: never let it break the scan loop.
+    // Runs for a bounded window then auto-stops; emails the summary once when it
+    // ends so it can't silently run forever. Defensive: never break the scan loop.
     try {
-      await makerShadow.tick(results, polyTrader);
+      if (makerShadow.isActive()) {
+        await makerShadow.tick(results, polyTrader);
+      } else if (!makerShadow.hasFinalized()) {
+        await sendShadowSummaryEmail(makerShadow.summary());
+        makerShadow.markFinalized();
+        console.log('Maker shadow experiment window ended — summary emailed, logging stopped.');
+      }
     } catch (e) {
       console.error('makerShadow error:', e.message);
     }
