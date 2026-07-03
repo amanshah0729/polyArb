@@ -27,7 +27,9 @@ function tierForCost(bestCost) {
 
 const BFA_MIN_BET = 5;
 
-function sizeArb({ bestCost, bfaImplied, polyImplied, polyPrice, availableBalance, scaleFactor = 1 }) {
+const polyBook = require('./polyBook');
+
+function sizeArb({ bestCost, bfaImplied, polyImplied, polyPrice, availableBalance, scaleFactor = 1, polyBook: book = null, intent = null, feeMode = 'taker' }) {
   if (!Number.isFinite(bestCost) || !Number.isFinite(bfaImplied) || !Number.isFinite(polyImplied)) {
     return null;
   }
@@ -54,8 +56,33 @@ function sizeArb({ bestCost, bfaImplied, polyImplied, polyPrice, availableBalanc
   if (bfaAmount < BFA_MIN_BET) return null;
 
   const px = Number.isFinite(polyPrice) && polyPrice > 0 ? polyPrice : polyImplied;
-  const polyNotional = bfaAmount * (polyImplied / bfaImplied);
-  const polyQuantity = Math.round((polyNotional / px) * 100) / 100;
+  let polyNotional = bfaAmount * (polyImplied / bfaImplied);
+  let polyQuantity = Math.round((polyNotional / px) * 100) / 100;
+
+  // Depth-aware clamp: if a book snapshot is supplied, cap polyQuantity at the
+  // largest quantity where every marginal share still has positive score:
+  // (price + fee + bfaImplied) < 1 + λ·bfaImplied·𝟙(rollover-qualifying).
+  let depthInfo = null;
+  if (book && intent) {
+    const mp = polyBook.maxProfitableSize({ book, intent, bfaImplied, feeMode });
+    depthInfo = {
+      maxShares: mp.maxShares,
+      vwapAtMax: mp.vwapAtMax,
+      maxBfaStake: mp.maxBfaStake,
+      expectedPnl: mp.expectedPnl,
+      lastAcceptedPx: mp.lastAcceptedPx,
+      depthClamped: false,
+    };
+    if (mp.maxShares > 0 && polyQuantity > mp.maxShares + 1e-6) {
+      polyQuantity = Math.round(mp.maxShares * 100) / 100;
+      // Re-derive BFA amount from the clamped Poly quantity so the hedge stays equal-payout.
+      bfaAmount = Math.round(polyQuantity * bfaImplied * 100) / 100;
+      polyNotional = polyQuantity * px;
+      depthInfo.depthClamped = true;
+      rationale.push(`depth-clamped to ${polyQuantity} shares (max profitable)`);
+      if (bfaAmount < BFA_MIN_BET) return null;
+    }
+  }
 
   return {
     bfaAmount: Math.round(bfaAmount * 100) / 100,
@@ -64,6 +91,7 @@ function sizeArb({ bestCost, bfaImplied, polyImplied, polyPrice, availableBalanc
     polyPriceUsed: px,
     tier: tier.label,
     rationale: rationale.join('; '),
+    ...(depthInfo ? { depth: depthInfo } : {}),
   };
 }
 

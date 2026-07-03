@@ -24,6 +24,9 @@ const stats = require('./stats');
 const cooldown = require('./bfaCooldown');
 const { executeArb } = require('./arbExecutor');
 const { sizeArb } = require('./betSizing');
+const polyTrader = require('./polyTrader');
+const polyBook = require('./polyBook');
+const makerShadow = require('./makerShadow');
 const { getBalance } = require('../scripts/bfagaming/placeBet');
 
 const OUT_DIR = path.join(__dirname, '..', 'outputs', 'bfagaming');
@@ -80,6 +83,30 @@ function pruneDedup() {
   }
 }
 
+// ── True P&L after Polymarket taker fees (pre-bonus) ─────────────────────────
+// Uses scan-time numbers (bfaBet, polyBet, bfaImplied, chosen polyImplied) and
+// the PM.US DCM fee formula (taker per-share = max($0.01, 0.05·p·(1−p))).
+// This is the "is this actually positive after fees?" filter used to gate
+// emails and highlight rows. Pre-bonus on purpose — the bonus is amortized
+// promo credit, not realized cash on this single bet.
+function computeTruePnl(r) {
+  const W = Number(r.bfaBet);
+  const P = Number(r.polyBet);
+  const bfaImp = Number(r.bfaImplied);
+  const polyImp = Number(r.polyImplied);
+  if (![W, P, bfaImp, polyImp].every(Number.isFinite) || polyImp <= 0 || bfaImp <= 0) {
+    return { truePnlAfterFees: null, truePositive: false };
+  }
+  const qty = P / polyImp;
+  const feePerShare = Math.max(0.01, 0.05 * polyImp * (1 - polyImp));
+  const polyFees = qty * feePerShare;
+  const polyAllInCost = P + polyFees;
+  const pnlIfBfaWins  = W / bfaImp - W - polyAllInCost;
+  const pnlIfPolyWins = qty - W - polyAllInCost;
+  const truePnlAfterFees = Math.min(pnlIfBfaWins, pnlIfPolyWins);
+  return { truePnlAfterFees, truePositive: truePnlAfterFees > 0 };
+}
+
 // ── Email ─────────────────────────────────────────────────────────────────────
 
 async function sendArbEmail(arbs) {
@@ -93,16 +120,17 @@ async function sendArbEmail(arbs) {
       `  Profit:    ${profitStr}%`,
       `  BFA bet:   $${a.bfaBet.toFixed(2)}`,
       `  Poly bet:  $${a.polyBet.toFixed(2)}`,
-      `  P&L:       $${a.guaranteedPnl.toFixed(2)}`,
-      `  Net value: $${a.netValue.toFixed(2)}`,
+      `  P&L (pre-fee): $${a.guaranteedPnl.toFixed(2)}`,
+      `  P&L after fees: $${(a.truePnlAfterFees ?? 0).toFixed(2)}`,
+      `  Net value (incl. bonus): $${a.netValue.toFixed(2)}`,
     ].join('\n');
   });
 
   const count = arbs.length;
-  const subject = `Arb Detected – ${count} opportunit${count === 1 ? 'y' : 'ies'} found`;
+  const subject = `Arb Detected – ${count} opportunit${count === 1 ? 'y' : 'ies'} found (after fees)`;
 
   const body = [
-    `${count} arb opportunit${count === 1 ? 'y' : 'ies'} (cost ${ARB_MIN_COST.toFixed(3)}–${ARB_MAX_COST.toFixed(3)}):`,
+    `${count} arb opportunit${count === 1 ? 'y' : 'ies'} with positive P&L after Polymarket taker fees:`,
     '',
     ...lines.join('\n\n───────────────────────────\n\n').split('\n'),
     '',
@@ -193,14 +221,20 @@ async function tick() {
 
   try {
     const results = await runScan();
+    // Decorate each row with after-fee P&L so the frontend and email filter
+    // share one source of truth.
+    for (const r of results) Object.assign(r, computeTruePnl(r));
     latestResults = results;
     writeCSV(results);
     const arbs = results.filter((r) => r.hasArb && r.bestCost >= ARB_MIN_COST && r.bestCost <= ARB_MAX_COST);
+    // Email only on arbs that are actually positive after Polymarket taker
+    // fees (pre-bonus). Use truePositive instead of the pre-fee cost band.
+    const trueArbs = arbs.filter((r) => r.truePositive);
 
     // Filter out already-notified arbs
-    const newArbs = arbs.filter((a) => !alreadyNotified(a));
+    const newArbs = trueArbs.filter((a) => !alreadyNotified(a));
 
-    console.log(`Scan done in ${((Date.now() - start) / 1000).toFixed(1)}s — ${results.length} games, ${arbs.length} arbs, ${newArbs.length} new`);
+    console.log(`Scan done in ${((Date.now() - start) / 1000).toFixed(1)}s — ${results.length} games, ${arbs.length} pre-fee arbs, ${trueArbs.length} positive after fees, ${newArbs.length} new`);
 
     eventLog.scan({
       durationMs: Date.now() - start,
@@ -221,6 +255,14 @@ async function tick() {
     if (newArbs.length > 0) {
       await sendArbEmail(newArbs);
       newArbs.forEach(markNotified);
+    }
+
+    // Phase 1 maker-fill shadow experiment — logs only, places no orders.
+    // Defensive: never let it break the scan loop.
+    try {
+      await makerShadow.tick(results, polyTrader);
+    } catch (e) {
+      console.error('makerShadow error:', e.message);
     }
 
     lastScanTime = new Date().toISOString();
@@ -278,7 +320,9 @@ async function handleExecute(req, res, cors) {
   try { payload = await readJsonBody(req); }
   catch (e) { return json(400, { error: 'bad_body', message: e.message }); }
 
-  const { bfa: bfaIn, poly: polyIn, meta = {}, scaleFactor = 1 } = payload || {};
+  const { bfa: bfaIn, poly: polyIn, meta = {}, scaleFactor = 1, execMode: execModeIn, iocFallback: iocFallbackIn } = payload || {};
+  const execMode = execModeIn === 'maker' ? 'maker' : 'ioc';
+  const feeMode = execMode === 'maker' ? 'maker' : 'taker';
   if (!bfaIn || !polyIn) return json(400, { error: 'missing_bfa_or_poly' });
 
   const requiredBfa = ['eventId', 'fixtureId', 'marketType', 'side', 'contestantId', 'price'];
@@ -301,11 +345,22 @@ async function handleExecute(req, res, cors) {
   const bestCost = Number(meta.bestCost);
   const bfaImplied = Number(meta.bfaImplied);
   const polyImplied = Number(meta.polyImplied);
+  // Fetch Poly book so sizing can depth-clamp before we place anything.
+  let depthRaw = null;
+  try {
+    const d = await polyTrader.getDepth(polyIn.marketSlug);
+    depthRaw = d.raw;
+  } catch (e) {
+    console.warn(`[execute] depth fetch failed for ${polyIn.marketSlug}: ${e.message}`);
+  }
   const sized = sizeArb({
     bestCost, bfaImplied, polyImplied,
     polyPrice: Number(polyIn.expectedPrice),
     availableBalance: balance,
     scaleFactor: Number(scaleFactor),
+    polyBook: depthRaw,
+    intent: polyIn.intent,
+    feeMode,
   });
   if (!sized) {
     const tier = require('./betSizing').tierForCost(bestCost);
@@ -338,7 +393,11 @@ async function handleExecute(req, res, cors) {
   };
 
   try {
-    const result = await executeArb({ bfa, poly, meta: { ...meta, sizing: sized, availableBalance: balance } });
+    const result = await executeArb({
+      bfa, poly,
+      meta: { ...meta, sizing: sized, availableBalance: balance, execMode },
+      opts: { execMode, iocFallback: !!iocFallbackIn },
+    });
     return json(200, { ok: true, sizing: sized, result });
   } catch (e) {
     console.error('executeArb threw:', e);
@@ -361,6 +420,37 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'POST' && req.url === '/execute') {
     return handleExecute(req, res, cors);
+  }
+
+  if (req.method === 'GET' && req.url?.startsWith('/depth')) {
+    const u = new URL(req.url, 'http://localhost');
+    const slug = u.searchParams.get('slug');
+    const intent = u.searchParams.get('intent');
+    const bfaImpliedRaw = u.searchParams.get('bfaImplied');
+    const feeModeRaw = u.searchParams.get('feeMode');
+    const feeMode = feeModeRaw === 'maker' ? 'maker' : feeModeRaw === 'none' ? 'none' : 'taker';
+    const lambdaRaw = Number(u.searchParams.get('lambda'));
+    const lambda = Number.isFinite(lambdaRaw) && lambdaRaw >= 0 ? lambdaRaw : undefined;
+    if (!slug || !intent) {
+      res.writeHead(400, { 'Content-Type': 'application/json', ...cors });
+      return res.end(JSON.stringify({ error: 'missing slug or intent' }));
+    }
+    try {
+      const d = await polyTrader.getDepth(slug);
+      const bfaImplied = Number(bfaImpliedRaw);
+      const mp = Number.isFinite(bfaImplied) && bfaImplied > 0 && bfaImplied < 1
+        ? polyBook.maxProfitableSize({ book: d.raw, intent, bfaImplied, feeMode, ...(lambda != null ? { lambda } : {}) })
+        : null;
+      res.writeHead(200, { 'Content-Type': 'application/json', ...cors });
+      return res.end(JSON.stringify({
+        slug, intent, bfaImplied: Number.isFinite(bfaImplied) ? bfaImplied : null,
+        feeMode,
+        bids: d.bids, offers: d.offers, max: mp,
+      }));
+    } catch (e) {
+      res.writeHead(502, { 'Content-Type': 'application/json', ...cors });
+      return res.end(JSON.stringify({ error: 'depth_fetch_failed', message: e.message }));
+    }
   }
 
   if (req.url === '/health' || req.url === '/') {
@@ -387,6 +477,110 @@ const server = http.createServer(async (req, res) => {
     } catch (e) {
       res.writeHead(500, { 'Content-Type': 'application/json', ...cors });
       res.end(JSON.stringify({ error: e.message }));
+    }
+  } else if (req.url?.startsWith('/bets-history')) {
+    try {
+      const u = new URL(req.url, 'http://localhost');
+      const days = Math.max(1, Math.min(30, parseInt(u.searchParams.get('days'), 10) || 7));
+      const since = Date.now() - days * 24 * 60 * 60 * 1000;
+      const finals = eventLog.readTypes(['final'], since);
+
+      // BFA promo: $200 bonus / $4800 rollover. Mirror scan.js constants.
+      const BONUS = 200, ROLLOVER = 4800;
+      const americanToImplied = (a) => {
+        const n = Number(a);
+        if (!Number.isFinite(n) || n === 0) return null;
+        return n > 0 ? 100 / (n + 100) : -n / (-n + 100);
+      };
+
+      const rows = finals
+        .filter(e => e.outcome === 'filled_both' && e.bfa?.idTransaction && e.polyBuy?.filledQty > 0)
+        .map(e => {
+          const W = Number(e.bfa.amount) || 0;
+          const american = e.bfa.price;
+          const bfaImplied = americanToImplied(american);
+          const qty = Number(e.polyBuy.filledQty) || 0;
+          const avgPx = Number(e.polyBuy.avgPx) || 0;
+          const polyNotional = qty * avgPx;
+
+          // Polymarket.US fee. Maker gets a rebate (negative fee).
+          // taker per-share: max($0.01, 0.05 × p × (1-p))
+          // maker rebate per-share: 0.0125 × p × (1-p)  (no floor)
+          const execMode = e.execMode === 'maker' ? 'maker' : 'taker';
+          const feePerShare = execMode === 'maker'
+            ? -(0.0125 * avgPx * (1 - avgPx))
+            : Math.max(0.01, 0.05 * avgPx * (1 - avgPx));
+          const polyFees = qty * feePerShare;             // signed: positive=cost, negative=rebate
+          const polyAllInCost = polyNotional + polyFees;  // cash actually debited
+
+          const pnlIfBfaWins  = bfaImplied ? (W / bfaImplied) - W - polyAllInCost : null;
+          const pnlIfPolyWins = qty - W - polyAllInCost;
+          const rawPnl = (pnlIfBfaWins != null) ? Math.min(pnlIfBfaWins, pnlIfPolyWins) : pnlIfPolyWins;
+          const bonusCredit = W * BONUS / ROLLOVER;
+          const pnlWithBonus = rawPnl + bonusCredit;
+          return {
+            attemptId: e.attemptId,
+            timestamp: e.timestamp,
+            sport: e.sport,
+            date: e.date,
+            strategy: e.strategy,
+            awayTeam: e.awayTeam,
+            homeTeam: e.homeTeam,
+            marketType: e.marketType,
+            line: e.line,
+            bfa: { stake: W, americanOdds: american, idTransaction: e.bfa.idTransaction, impliedProb: bfaImplied },
+            poly: {
+              qty, avgPx,
+              notional: polyNotional,
+              feePerShare, fees: polyFees,
+              allInCost: polyAllInCost,
+              effectivePrice: qty > 0 ? polyAllInCost / qty : null,
+              execMode,
+              orderId: e.polyBuy.orderId,
+            },
+            scanGuaranteedPnl: e.guaranteedPnl ?? null,
+            rawPnl,
+            bonusCredit,
+            pnlWithBonus,
+            outcomeIfBfaWins: pnlIfBfaWins,
+            outcomeIfPolyWins: pnlIfPolyWins,
+          };
+        })
+        .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+      const totals = rows.reduce((acc, r) => ({
+        bets: acc.bets + 1,
+        bfaStake: acc.bfaStake + r.bfa.stake,
+        polyNotional: acc.polyNotional + r.poly.notional,
+        polyFees: acc.polyFees + r.poly.fees,
+        polyAllInCost: acc.polyAllInCost + r.poly.allInCost,
+        rawPnl: acc.rawPnl + r.rawPnl,
+        bonusCredit: acc.bonusCredit + r.bonusCredit,
+        pnlWithBonus: acc.pnlWithBonus + r.pnlWithBonus,
+      }), { bets: 0, bfaStake: 0, polyNotional: 0, polyFees: 0, polyAllInCost: 0, rawPnl: 0, bonusCredit: 0, pnlWithBonus: 0 });
+
+      res.writeHead(200, { 'Content-Type': 'application/json', ...cors });
+      return res.end(JSON.stringify({ days, rows, totals }));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json', ...cors });
+      return res.end(JSON.stringify({ error: e.message }));
+    }
+  } else if (req.url?.startsWith('/maker-shadow')) {
+    try {
+      const u = new URL(req.url, 'http://localhost');
+      const days = Math.max(1, Math.min(30, parseInt(u.searchParams.get('days'), 10) || 7));
+      const since = Date.now() - days * 24 * 60 * 60 * 1000;
+      const recent = u.searchParams.get('recent') === '1';
+      const body = { summary: makerShadow.summary(since) };
+      if (recent) {
+        body.closes = makerShadow.readLog('shadow_close', since).slice(-100);
+        body.opens = makerShadow.readLog('shadow_open', since).slice(-100);
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json', ...cors });
+      return res.end(JSON.stringify(body));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json', ...cors });
+      return res.end(JSON.stringify({ error: e.message }));
     }
   } else if (req.url?.startsWith('/events')) {
     const u = new URL(req.url, 'http://localhost');

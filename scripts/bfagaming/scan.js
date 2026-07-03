@@ -26,7 +26,9 @@ const RATE_LIMIT_MS    = 200;
 const BFA_MARKET_TYPES = { 1: 'moneyline', 2: 'spread', 3: 'total' };
 
 // ── Bet sizing constants ───────────────────────────────────────────────────────
-const BONUS    = 200;
+// Whole locked BFA balance (deposit + bonus) — unlocks after ROLLOVER of
+// qualifying wagers. Marginal credit λ = LOCKED/ROLLOVER = 6.25¢ per $1 staked.
+const LOCKED   = 300;
 const ROLLOVER = 4800;
 const MIN_BET  = 10;
 const MAX_BET  = 100;
@@ -111,6 +113,7 @@ async function fetchBFAGames(slug) {
       const fixture = game.fixtures[0];
       const base = {
         name: game.name,
+        description: game.description ?? null,
         startDate: game.startDate ?? fixture?.date ?? null,
         status: game.status ?? 'Upcoming',
         awayTeam: away.name,
@@ -186,11 +189,37 @@ async function fetchBFAGames(slug) {
       }
     }
 
-    const mlCount = entries.filter(e => e.marketType === 'moneyline').length;
-    const spCount = entries.filter(e => e.marketType === 'spread').length;
-    const totCount = entries.filter(e => e.marketType === 'total').length;
+    // Sanity-check: ensure each spread/total entry agrees with its fixture's
+    // moneyline on which side is the favorite. BFA's spread API has been
+    // observed to flip the away/home side codes, producing a row where the ML
+    // favorite shows up on the opposite side of the spread. That generates
+    // phantom "arbs" because the cross-book mirror outcomes are misaligned.
+    const mlByFixture = new Map();
+    for (const e of entries) {
+      if (e.marketType === 'moneyline' && e.bfaFixtureId != null) {
+        mlByFixture.set(e.bfaFixtureId, e);
+      }
+    }
+    const filtered = entries.filter(e => {
+      if (e.marketType === 'moneyline') return true;
+      if (e.marketType === 'total') return true;  // O/U has no favorite asymmetry
+      const ml = mlByFixture.get(e.bfaFixtureId);
+      if (!ml) return true;  // can't verify, allow through
+      // "Favorite" = side with the more-negative American price.
+      const mlAwayFav = (ml.awayOdds ?? 0) < (ml.homeOdds ?? 0);
+      const spAwayFav = (e.awayOdds ?? 0) < (e.homeOdds ?? 0);
+      if (mlAwayFav !== spAwayFav) {
+        console.log(`    ⚠ BFA spread/ML favorite mismatch on fixture ${e.bfaFixtureId} (${e.awayTeam} vs ${e.homeTeam}): ML away=${ml.awayOdds}/home=${ml.homeOdds}, spread away=${e.awayOdds}/home=${e.homeOdds} — dropping spread entry`);
+        return false;
+      }
+      return true;
+    });
+
+    const mlCount = filtered.filter(e => e.marketType === 'moneyline').length;
+    const spCount = filtered.filter(e => e.marketType === 'spread').length;
+    const totCount = filtered.filter(e => e.marketType === 'total').length;
     console.log(`  BFAGaming ${slug.toUpperCase()}: ${mlCount} ML, ${spCount} spreads, ${totCount} totals`);
-    return entries;
+    return filtered;
   } catch (err) {
     console.warn(`  BFAGaming ${slug.toUpperCase()} error: ${err.message}`);
     return [];
@@ -230,10 +259,16 @@ const SPORT_SLUG_PREFIXES = {
   mma: [],
 };
 
-const MAX_DATE_DRIFT_DAYS = 2; // max days apart before we consider a market stale/rescheduled
+const MAX_DATE_DRIFT_DAYS = 1; // max days apart — was 2, but in NBA/NHL playoffs that pulls in
+                               // the next game's market on the SAME series and produces phantom
+                               // arbs (different game, different conditional odds). 1 day still
+                               // covers timezone boundary cases (US ET vs UTC).
 
 function extractSlugDate(slug) {
-  const m = slug.match(/(\d{4}-\d{2}-\d{2})$/);
+  // Date can appear mid-slug for derived markets (e.g. mlb-bos-nyy-2026-06-06-total-8pt5),
+  // not just at the end (mlb-min-hou-2026-06-29). Match the first date anywhere so the
+  // date cross-check still fires on total/spread slugs.
+  const m = slug.match(/(\d{4}-\d{2}-\d{2})/);
   return m ? m[1] : null;
 }
 
@@ -247,12 +282,52 @@ function datesWithinRange(bfaStartDate, slugDateStr) {
   return diffDays <= MAX_DATE_DRIFT_DAYS;
 }
 
+// Polymarket slugs (mlb-min-hou-2026-06-29) date US sports by their US-Eastern game
+// date. BFA startDate is an absolute instant; comparing it as a UTC instant is wrong —
+// an evening game in a US timezone crosses into the next UTC day, making the *next-day*
+// market look "closer" than the real one. Convert the BFA instant to its ET calendar
+// date so it lines up with the slug convention.
+function bfaEasternDate(startDate) {
+  if (!startDate) return null;
+  const d = new Date(startDate);
+  if (isNaN(d)) return null;
+  try {
+    // en-CA formats as YYYY-MM-DD
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/New_York',
+      year: 'numeric', month: '2-digit', day: '2-digit',
+    }).format(d);
+  } catch {
+    return d.toISOString().split('T')[0];
+  }
+}
+
+// Whole-day distance between two YYYY-MM-DD strings (null if either is missing).
+function calendarDayDiff(dateStrA, dateStrB) {
+  if (!dateStrA || !dateStrB) return null;
+  const a = new Date(dateStrA + 'T00:00:00Z');
+  const b = new Date(dateStrB + 'T00:00:00Z');
+  if (isNaN(a) || isNaN(b)) return null;
+  return Math.round(Math.abs(a - b) / (1000 * 60 * 60 * 24));
+}
+
 function matchPredexonMarket(bfaEntry, predexonMarkets, sportSlug) {
   const mt = bfaEntry.marketType;
   const awayName = bfaEntry.marketType === 'total' ? (bfaEntry._realAway ?? '') : bfaEntry.awayTeam;
   const homeName = bfaEntry.marketType === 'total' ? (bfaEntry._realHome ?? '') : bfaEntry.homeTeam;
 
   const allowedPrefixes = SPORT_SLUG_PREFIXES[sportSlug] ?? [];
+  // BFA game date in Polymarket's slug convention (US Eastern).
+  const bfaDate = bfaEasternDate(bfaEntry.startDate);
+
+  // Collect ALL markets that match teams + market type, then choose the best one.
+  // Daily-series sports (MLB/NBA/NHL) list the same matchup on consecutive days; the
+  // current game is the liquid one and the next day's is a near-empty 50/50 placeholder.
+  // Returning the first match grabbed those placeholders and minted phantom arbs, so we
+  // rank candidates by exact-date-match first, then by volume.
+  const candidates = [];
+  const pushCandidate = (res, mkt, slugDate, dayDiff) =>
+    candidates.push({ res, slugDate, dayDiff, volume: mkt.total_volume_usd ?? 0 });
 
   for (const mkt of predexonMarkets) {
     const outcomes = mkt.outcomes ?? [];
@@ -271,12 +346,13 @@ function matchPredexonMarket(bfaEntry, predexonMarkets, sportSlug) {
 
     const slug = (mkt.market_slug ?? '').toLowerCase();
 
-    // Date cross-check: skip markets where the Polymarket event date doesn't match BFA's date.
-    // Catches cancelled/rescheduled events where Poly still has the old stale market.
+    // Date cross-check: reject markets more than MAX_DATE_DRIFT_DAYS off the BFA game's
+    // Eastern date. Catches cancelled/rescheduled events and the next-day series market.
+    // The remaining drift (timezone edge cases) is resolved by exact-date ranking below.
     const slugDate = extractSlugDate(slug);
-    if (!datesWithinRange(bfaEntry.startDate, slugDate)) {
-      const bfaDateStr = bfaEntry.startDate ? new Date(bfaEntry.startDate).toISOString().split('T')[0] : '?';
-      console.log(`    ⚠ Date mismatch: BFA=${bfaDateStr} vs Poly=${slugDate} — skipping ${slug}`);
+    const dayDiff = calendarDayDiff(bfaDate, slugDate); // null if either date is missing
+    if (dayDiff != null && dayDiff > MAX_DATE_DRIFT_DAYS) {
+      console.log(`    ⚠ Date mismatch: BFA=${bfaDate} vs Poly=${slugDate} (${dayDiff}d) — skipping ${slug}`);
       continue;
     }
 
@@ -288,10 +364,11 @@ function matchPredexonMarket(bfaEntry, predexonMarkets, sportSlug) {
 
     // Series vs single-game guard: a series-winner market must not match a single-game BFA
     // entry (or vice versa). Poly series slugs/titles contain "series", "advance", "win-the",
-    // "round-1", etc. BFA series events have "Series" or "series" in game.name.
+    // "round-1", etc. BFA series events have "Series" in game.name OR game.description
+    // (MLB uses description like "MLB Series Prices *= 4 Game Series").
     const seriesRe = /\b(series|advance|win.the|playoff.winner|round.\d)\b/i;
     const polyIsSeries = seriesRe.test(slug) || seriesRe.test(title);
-    const bfaIsSeries = seriesRe.test(bfaEntry.name ?? '');
+    const bfaIsSeries = seriesRe.test(bfaEntry.name ?? '') || seriesRe.test(bfaEntry.description ?? '');
     if (polyIsSeries !== bfaIsSeries) {
       console.log(`    ⚠ Series/game mismatch: BFA "${bfaEntry.name}" (${bfaIsSeries ? 'series' : 'game'}) vs Poly "${slug}" (${polyIsSeries ? 'series' : 'game'}) — skipping`);
       continue;
@@ -300,6 +377,11 @@ function matchPredexonMarket(bfaEntry, predexonMarkets, sportSlug) {
     if (mt === 'moneyline') {
       // Slug should NOT contain 'total' or 'spread'
       if (slug.includes('total') || slug.includes('spread') || slug.includes('o-u') || slug.includes('pt')) continue;
+      // Full-game moneyline slugs END with the game date (mlb-lad-oak-2026-06-29). Derived
+      // markets — first-five-winner, nrfi, winner-draw — carry a suffix after the date and
+      // are a different bet than the full-game line, so exclude any dated slug that doesn't
+      // end on its date.
+      if (/\d{4}-\d{2}-\d{2}/.test(slug) && !/\d{4}-\d{2}-\d{2}$/.test(slug)) continue;
       // Labels should be team/fighter names, not Over/Under
       if (l0 === 'over' || l0 === 'under' || l1 === 'over' || l1 === 'under') continue;
 
@@ -329,10 +411,9 @@ function matchPredexonMarket(bfaEntry, predexonMarkets, sportSlug) {
 
       // Determine which outcome is away vs home
       if (awayInL0) {
-        return { market: mkt, marketSlug: mkt.market_slug, awayPrice: p0, homePrice: p1, awayToken: t0, homeToken: t1, swapped: false };
-      }
-      if (homeInL0) {
-        return { market: mkt, marketSlug: mkt.market_slug, awayPrice: p1, homePrice: p0, awayToken: t1, homeToken: t0, swapped: true };
+        pushCandidate({ market: mkt, marketSlug: mkt.market_slug, awayPrice: p0, homePrice: p1, awayToken: t0, homeToken: t1, swapped: false, isSeries: polyIsSeries }, mkt, slugDate, dayDiff);
+      } else if (homeInL0) {
+        pushCandidate({ market: mkt, marketSlug: mkt.market_slug, awayPrice: p1, homePrice: p0, awayToken: t1, homeToken: t0, swapped: true, isSeries: polyIsSeries }, mkt, slugDate, dayDiff);
       }
 
     } else if (mt === 'total') {
@@ -344,17 +425,18 @@ function matchPredexonMarket(bfaEntry, predexonMarkets, sportSlug) {
       const lineRe = new RegExp(`(^|[^0-9])${lineStr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}($|[^0-9pt])`);
       const titleRe = new RegExp(`(^|[^0-9.])${String(bfaLine).replace('.', '\\.')}($|[^0-9.])`);
       if (!lineRe.test(slug) && !titleRe.test(title)) continue;
-      // Verify teams appear in the title to prevent cross-sport matches
+      // Verify BOTH teams appear in the title — a total title reads "Away vs. Home: O/U X",
+      // so requiring only one team let a stale same-team-different-opponent market match
+      // (e.g. a Nationals@Red Sox total matching a Red Sox@Yankees market).
       const awayNorm = normalizeTeam(awayName);
       const homeNorm = normalizeTeam(homeName);
-      if (!title.includes(awayNorm) && !title.includes(homeNorm)) continue;
+      if (!(title.includes(awayNorm) && title.includes(homeNorm))) continue;
 
       // Outcomes should be Over/Under
       if (l0 === 'over') {
-        return { market: mkt, marketSlug: mkt.market_slug, awayPrice: p0, homePrice: p1, awayToken: t0, homeToken: t1, swapped: false };
-      }
-      if (l0 === 'under') {
-        return { market: mkt, marketSlug: mkt.market_slug, awayPrice: p1, homePrice: p0, awayToken: t1, homeToken: t0, swapped: true };
+        pushCandidate({ market: mkt, marketSlug: mkt.market_slug, awayPrice: p0, homePrice: p1, awayToken: t0, homeToken: t1, swapped: false, isSeries: polyIsSeries }, mkt, slugDate, dayDiff);
+      } else if (l0 === 'under') {
+        pushCandidate({ market: mkt, marketSlug: mkt.market_slug, awayPrice: p1, homePrice: p0, awayToken: t1, homeToken: t0, swapped: true, isSeries: polyIsSeries }, mkt, slugDate, dayDiff);
       }
 
     } else if (mt === 'spread') {
@@ -380,7 +462,6 @@ function matchPredexonMarket(bfaEntry, predexonMarkets, sportSlug) {
       // with signs (e.g. away=+1.5, home=-1.5). Both platforms must agree on which team is favored.
       const polyLineRe = /([+-])\s*(\d+(?:\.\d+)?)\s*$/;
       const l0Match = l0.match(polyLineRe);
-      const l1Match = l1.match(polyLineRe);
 
       if (l0.includes(awayNorm) || awayNorm.includes(l0)) {
         // l0 is the away team — check that the Poly sign matches BFA's away line sign
@@ -392,9 +473,8 @@ function matchPredexonMarket(bfaEntry, predexonMarkets, sportSlug) {
             continue;
           }
         }
-        return { market: mkt, marketSlug: mkt.market_slug, awayPrice: p0, homePrice: p1, awayToken: t0, homeToken: t1, swapped: false };
-      }
-      if (l0.includes(homeNorm) || homeNorm.includes(l0)) {
+        pushCandidate({ market: mkt, marketSlug: mkt.market_slug, awayPrice: p0, homePrice: p1, awayToken: t0, homeToken: t1, swapped: false, isSeries: polyIsSeries }, mkt, slugDate, dayDiff);
+      } else if (l0.includes(homeNorm) || homeNorm.includes(l0)) {
         // l0 is the home team — check that the Poly sign matches BFA's home line sign
         if (l0Match) {
           const polyHomeSign = l0Match[1] === '-' ? -1 : 1;
@@ -404,12 +484,27 @@ function matchPredexonMarket(bfaEntry, predexonMarkets, sportSlug) {
             continue;
           }
         }
-        return { market: mkt, marketSlug: mkt.market_slug, awayPrice: p1, homePrice: p0, awayToken: t1, homeToken: t0, swapped: true };
+        pushCandidate({ market: mkt, marketSlug: mkt.market_slug, awayPrice: p1, homePrice: p0, awayToken: t1, homeToken: t0, swapped: true, isSeries: polyIsSeries }, mkt, slugDate, dayDiff);
       }
     }
   }
 
-  return null;
+  if (candidates.length === 0) return null;
+
+  // Rank: exact game-date match first (a next-day series market is 1 day off and must lose
+  // to the real game), then highest volume (the live game dwarfs placeholders).
+  candidates.sort((a, b) => {
+    const da = a.dayDiff == null ? 99 : a.dayDiff;
+    const db = b.dayDiff == null ? 99 : b.dayDiff;
+    if (da !== db) return da - db;
+    return b.volume - a.volume;
+  });
+
+  const best = candidates[0];
+  if (best.dayDiff && best.dayDiff > 0) {
+    console.log(`    ⚠ No exact-date Poly market for ${awayName} @ ${homeName} (BFA ${bfaDate}); using nearest ${best.res.marketSlug} (${best.dayDiff}d off, vol $${Math.round(best.volume)})`);
+  }
+  return best.res;
 }
 
 // ── Team matching ─────────────────────────────────────────────────────────────
@@ -516,7 +611,10 @@ function sizeBet(b, p, C, r, bkr) {
   P = Math.round(P * 2) / 2;
 
   const guaranteedPnl = W * (1 - C) / b;
-  const amortizedBonus = W * BONUS / ROLLOVER;
+  // Rollover credit: bets at −200 or shorter odds (implied ≥ 2/3) don't count
+  // toward the wagering requirement, so they earn zero credit.
+  const qualifies = b < 2 / 3 - 1e-9;
+  const amortizedBonus = qualifies ? W * LOCKED / ROLLOVER : 0;
   const netValue = guaranteedPnl + amortizedBonus;
 
   return { W, P, guaranteedPnl, netValue };
@@ -595,14 +693,25 @@ async function runScan(opts = {}) {
     }
 
     for (const [, { realAway, realHome, entries }] of gameGroups) {
-      // Build search query — use normalized (city-stripped) names for better search results
-      // Full names like "Boston Bruins" return too many futures; "Bruins" finds the game
+      // Search Predexon per-team and merge. Predexon's search no longer returns
+      // results for combined two-team queries (e.g. "twins astros" → 0 results),
+      // but single-team queries (e.g. "astros") return the matchup fine.
+      // matchPredexonMarket validates BOTH teams + date downstream, so searching
+      // either team and merging by slug preserves precision while finding the game.
       const normAway = normalizeTeam(realAway);
       const normHome = normalizeTeam(realHome);
-      const query = `${normAway} ${normHome}`;
+      const query = `${normAway} / ${normHome}`; // display/logging only
 
-      const predexonMarkets = await searchPredexon(query);
-      await sleep(RATE_LIMIT_MS);
+      const bySlug = new Map();
+      for (const term of [normHome, normAway]) {
+        if (!term) continue;
+        const found = await searchPredexon(term);
+        await sleep(RATE_LIMIT_MS);
+        for (const m of found || []) {
+          if (m && m.market_slug && !bySlug.has(m.market_slug)) bySlug.set(m.market_slug, m);
+        }
+      }
+      const predexonMarkets = [...bySlug.values()];
 
       const liveCount = predexonMarkets.filter(m => {
         const outcomes = m.outcomes ?? [];
@@ -627,7 +736,7 @@ async function runScan(opts = {}) {
           continue;
         }
 
-        const { market: mkt, marketSlug: polyMarketSlug, awayPrice: midAway, homePrice: midHome, awayToken, homeToken, swapped: polySwapped } = match;
+        const { market: mkt, marketSlug: polyMarketSlug, awayPrice: midAway, homePrice: midHome, awayToken, homeToken, swapped: polySwapped, isSeries } = match;
         const volumeUsd = mkt.total_volume_usd ?? 0;
 
         // Skip low-volume markets — unwind ladder needs liquidity to exit cleanly if a leg fails.
@@ -703,6 +812,7 @@ async function runScan(opts = {}) {
           polyHomeToken: homeToken,
           polyAwayPrice: polyPrices.awayImplied,
           polyHomePrice: polyPrices.homeImplied,
+          isSeries: !!isSeries,
           // polymarket-us uses LONG (YES = outcome[0]) / SHORT (NO = outcome[1]) intents.
           // swapped=false → away is outcome[0] (LONG); swapped=true → away is outcome[1] (SHORT).
           polyAwayIntent: polySwapped ? 'ORDER_INTENT_BUY_SHORT' : 'ORDER_INTENT_BUY_LONG',

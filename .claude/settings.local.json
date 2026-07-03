@@ -50,7 +50,18 @@
       "Bash(echo \"exit=$?\")",
       "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\" http://localhost:3001/health)",
       "Bash(curl -s http://localhost:3001/health)",
-      "Bash(lsof -iTCP -sTCP:LISTEN -P -n)"
+      "Bash(lsof -iTCP -sTCP:LISTEN -P -n)",
+      "Bash(curl -s http://localhost:3001/results)",
+      "Bash(npm show *)",
+      "Bash(curl -s \"https://gamma-api.polymarket.com/markets?slug=nhl-lak-col-2026-04-20\")",
+      "Bash(curl -s \"https://gamma-api.polymarket.com/markets?closed=false&limit=20&order=volume&ascending=false&tag_slug=nhl\")",
+      "Bash(curl -s \"https://gamma-api.polymarket.com/markets?closed=false&limit=50&related_tags=nhl\")",
+      "Bash(lsof -i :3001 -sTCP:LISTEN)",
+      "Bash(curl -sS -m 3 http://localhost:3001/health)",
+      "Bash(curl *)",
+      "Bash(lsof *)",
+      "Bash(kill 33748)",
+      "Bash(ps *)"
     ]
   }
 }

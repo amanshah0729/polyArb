@@ -4,6 +4,7 @@ import { Suspense } from 'react';
 import ResultsClient from './ResultsClient';
 import RerunButton from './RerunButton';
 import TabBar from './TabBar';
+import BetsHistoryPanel from './BetsHistoryPanel';
 import StatsPanel from './StatsPanel';
 import PlaceBetButton, { type ArbPayload } from './PlaceBetButton';
 
@@ -521,7 +522,7 @@ function PredMarketContent() {
 // ── BetFast tab ───────────────────────────────────────────────────────────────
 
 async function fetchRemoteResults(): Promise<{ lastScanTime: string | null; results: any[] } | null> {
-  const url = process.env.NOTIFIER_URL;
+  const url = process.env.NOTIFIER_URL?.trim();
   if (!url) return null;
   try {
     const res = await fetch(`${url}/results`, { cache: 'no-store', signal: AbortSignal.timeout(5000) });
@@ -754,6 +755,8 @@ async function BetFastContent() {
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 p-6">
           {rows.map((row, i) => {
             const isArb = (row[arbIdx] ?? '') === 'YES';
+            const truePositive = !!rawArbs[i]?.truePositive;
+            const truePnlAfterFees = rawArbs[i]?.truePnlAfterFees;
             const sport = row[sportIdx] ?? '';
             const { side1, side2 } = getSideLabels(row);
             const marketLabel = getMarketLabel(row);
@@ -766,14 +769,16 @@ async function BetFastContent() {
             const polyHome = row[polyHomeIdx] ?? '';
             const volume = volumeIdx >= 0 ? row[volumeIdx] ?? '' : '';
 
+            const cardClasses = truePositive
+              ? 'border-[rgba(34,197,94,0.7)] bg-[rgba(34,197,94,0.12)] ring-2 ring-[rgba(34,197,94,0.5)] shadow-[0_0_24px_rgba(34,197,94,0.15)]'
+              : isArb
+                ? 'border-[rgba(34,197,94,0.4)] bg-[rgba(34,197,94,0.06)] ring-1 ring-[rgba(34,197,94,0.2)]'
+                : 'border-[rgba(255,255,255,0.08)] bg-[#111827]';
+
             return (
               <div
                 key={i}
-                className={`rounded-xl border transition-colors duration-150 ${
-                  isArb
-                    ? 'border-[rgba(34,197,94,0.4)] bg-[rgba(34,197,94,0.06)]'
-                    : 'border-[rgba(255,255,255,0.08)] bg-[#111827]'
-                } ${isArb ? 'ring-1 ring-[rgba(34,197,94,0.2)]' : ''}`}
+                className={`rounded-xl border transition-colors duration-150 ${cardClasses}`}
               >
                 {/* Header: sport + date + cost */}
                 <div className="flex items-center justify-between px-4 pt-4 pb-2">
@@ -784,8 +789,16 @@ async function BetFastContent() {
                     <span className="text-[#6b7280] text-xs">
                       {row[dateIdx] ?? ''} · {(row[timeIdx] ?? '').replace(/:00 /, ' ')}
                     </span>
+                    {truePositive && typeof truePnlAfterFees === 'number' && (
+                      <span
+                        className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-[#22c55e] text-[#0f172a]"
+                        title="Worst-case P&L after Polymarket taker fees, before BFA bonus."
+                      >
+                        +${truePnlAfterFees.toFixed(2)} after fees
+                      </span>
+                    )}
                   </div>
-                  <span className={`font-mono text-xs ${isArb ? 'text-[#22c55e] font-semibold' : 'text-[#6b7280]'}`}>
+                  <span className={`font-mono text-xs ${truePositive ? 'text-[#22c55e] font-bold' : isArb ? 'text-[#22c55e] font-semibold' : 'text-[#6b7280]'}`}>
                     {cost}
                   </span>
                 </div>
@@ -887,6 +900,11 @@ export default async function Results({
                 Arbitrage Results
               </h1>
             </div>
+
+            {/* Placed bets history */}
+            <Suspense fallback={null}>
+              <BetsHistoryPanel />
+            </Suspense>
 
             {/* Tabs */}
             <Suspense fallback={null}>
