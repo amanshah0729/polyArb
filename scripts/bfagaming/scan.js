@@ -14,12 +14,30 @@ const PREDEXON_API_KEY = process.env.PREDEXON_API_KEY;
 const BFA_BASE         = 'https://api.bfagaming.com/oddsservice';
 const PREDEXON_HOST    = 'api.predexon.com';
 const PREDEXON_BASE    = '/v2';
-// Broad set of slugs to probe — BFA has no listing endpoint, so we try all known slugs
+// Slugs from BFA's /oddsservice/navigation endpoint. Soccer leagues use
+// socc_* slugs (the bare 'soccer'/'epl'/'mls' slugs return nothing), NCAA
+// football is 'ncaa_f'. Empty sports cost one cheap request each.
 const ALL_BFA_SLUGS = [
   'nba', 'nhl', 'nfl', 'mlb', 'ufc', 'mma', 'boxing',
-  'soccer', 'tennis', 'golf', 'cricket', 'rugby',
-  'ncaab', 'ncaaf', 'epl', 'mls',
+  'tennis', 'golf', 'cricket', 'basketball', 'hockey', 'baseball',
+  'ncaa_f',
+  'socc_fifa_world_cup',
+  'socc_england_premier_league', 'socc_spain_la_liga', 'socc_italy_serie_a',
+  'socc_france_ligue_1', 'socc_uefa_champions_league',
 ];
+
+// Display/email label per slug (also the meta.sport used by the PM.US market
+// matcher, so labels here must exist in marketMatcher's TAG_BY_SPORT).
+const SPORT_LABELS = {
+  ncaa_f: 'NCAAF',
+  socc_fifa_world_cup: 'FWC',
+  socc_england_premier_league: 'EPL',
+  socc_spain_la_liga: 'LALIGA',
+  socc_italy_serie_a: 'SERIEA',
+  socc_france_ligue_1: 'LIGUE1',
+  socc_uefa_champions_league: 'UCL',
+};
+const sportLabel = (slug) => SPORT_LABELS[slug] ?? slug.toUpperCase();
 const RATE_LIMIT_MS    = 200;
 
 // BFA market type mapping
@@ -42,6 +60,8 @@ const BROWSER_HEADERS = {
   'Accept-Language': 'en-US,en;q=0.9',
 };
 
+const GET_TIMEOUT_MS = 15000;
+
 function get(url, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
     const parsedUrl = new URL(url);
@@ -49,8 +69,11 @@ function get(url, extraHeaders = {}) {
       hostname: parsedUrl.hostname,
       path: parsedUrl.pathname + parsedUrl.search,
       headers: { ...BROWSER_HEADERS, ...extraHeaders },
+      // Without a timeout, one dead socket hangs the entire scan forever —
+      // the notifier only schedules the next scan after this one finishes.
+      timeout: GET_TIMEOUT_MS,
     };
-    https.get(options, (res) => {
+    const req = https.get(options, (res) => {
       let data = '';
       res.on('data', (c) => (data += c));
       res.on('end', () => {
@@ -61,7 +84,9 @@ function get(url, extraHeaders = {}) {
         try { resolve(JSON.parse(data)); }
         catch { reject(new Error(`Bad JSON from ${url}`)); }
       });
-    }).on('error', reject);
+    });
+    req.on('timeout', () => req.destroy(new Error(`timeout after ${GET_TIMEOUT_MS}ms: ${url}`)));
+    req.on('error', reject);
   });
 }
 
@@ -127,6 +152,11 @@ async function fetchBFAGames(slug) {
         if (!marketType || !mkt.odds) continue;
 
         if (marketType === 'moneyline') {
+          // Soccer moneylines are 3-way (side 3 = draw). A two-leg hedge does
+          // NOT cover the draw — both legs lose — so these are never arbable
+          // with a single Poly binary. Skip them; totals and half-line spreads
+          // on the same game are binary and flow through normally.
+          if (mkt.odds.some((o) => o.side === 3)) continue;
           const awayOddsObj = mkt.odds.find((o) => o.side === 2);
           const homeOddsObj = mkt.odds.find((o) => o.side === 1);
           if (!awayOddsObj || !homeOddsObj) continue;
@@ -257,6 +287,7 @@ const SPORT_SLUG_PREFIXES = {
   mlb: ['mlb-'],
   ufc: [], // UFC slugs don't have a consistent prefix, skip filtering
   mma: [],
+  socc_fifa_world_cup: ['fifwc-'], // Predexon prefix for World Cup match markets
 };
 
 const MAX_DATE_DRIFT_DAYS = 1; // max days apart — was 2, but in NBA/NHL playoffs that pulls in
@@ -428,9 +459,8 @@ function matchPredexonMarket(bfaEntry, predexonMarkets, sportSlug) {
       // Verify BOTH teams appear in the title — a total title reads "Away vs. Home: O/U X",
       // so requiring only one team let a stale same-team-different-opponent market match
       // (e.g. a Nationals@Red Sox total matching a Red Sox@Yankees market).
-      const awayNorm = normalizeTeam(awayName);
-      const homeNorm = normalizeTeam(homeName);
-      if (!(title.includes(awayNorm) && title.includes(homeNorm))) continue;
+      // Alias-aware: "USA" must match a "United States vs. Belgium" title.
+      if (!(textHasTeam(title, awayName) && textHasTeam(title, homeName))) continue;
 
       // Outcomes should be Over/Under
       if (l0 === 'over') {
@@ -450,12 +480,12 @@ function matchPredexonMarket(bfaEntry, predexonMarkets, sportSlug) {
       const titleRe = new RegExp(`(^|[^0-9.])${String(Math.abs(bfaLine)).replace('.', '\\.')}($|[^0-9.])`);
       if (!lineRe.test(slug) && !titleRe.test(title)) continue;
 
-      // Verify teams appear
+      // Verify teams appear (alias-aware for country names)
       const awayNorm = normalizeTeam(awayName);
       const homeNorm = normalizeTeam(homeName);
       const allText = `${l0} ${l1} ${title}`;
-      if (!(allText.includes(awayNorm) || awayNorm.includes(l0) || awayNorm.includes(l1))) continue;
-      if (!(allText.includes(homeNorm) || homeNorm.includes(l0) || homeNorm.includes(l1))) continue;
+      if (!(textHasTeam(allText, awayName) || awayNorm.includes(l0) || awayNorm.includes(l1))) continue;
+      if (!(textHasTeam(allText, homeName) || homeNorm.includes(l0) || homeNorm.includes(l1))) continue;
 
       // Extract signed line from Poly outcome labels to verify spread direction matches BFA.
       // Poly labels look like "phillies -1.5" or "cubs +1.5". BFA stores bfaAwayLine/bfaHomeLine
@@ -463,7 +493,7 @@ function matchPredexonMarket(bfaEntry, predexonMarkets, sportSlug) {
       const polyLineRe = /([+-])\s*(\d+(?:\.\d+)?)\s*$/;
       const l0Match = l0.match(polyLineRe);
 
-      if (l0.includes(awayNorm) || awayNorm.includes(l0)) {
+      if (textHasTeam(l0, awayName) || awayNorm.includes(l0)) {
         // l0 is the away team — check that the Poly sign matches BFA's away line sign
         if (l0Match) {
           const polyAwaySign = l0Match[1] === '-' ? -1 : 1;
@@ -474,7 +504,7 @@ function matchPredexonMarket(bfaEntry, predexonMarkets, sportSlug) {
           }
         }
         pushCandidate({ market: mkt, marketSlug: mkt.market_slug, awayPrice: p0, homePrice: p1, awayToken: t0, homeToken: t1, swapped: false, isSeries: polyIsSeries }, mkt, slugDate, dayDiff);
-      } else if (l0.includes(homeNorm) || homeNorm.includes(l0)) {
+      } else if (textHasTeam(l0, homeName) || homeNorm.includes(l0)) {
         // l0 is the home team — check that the Poly sign matches BFA's home line sign
         if (l0Match) {
           const polyHomeSign = l0Match[1] === '-' ? -1 : 1;
@@ -587,6 +617,81 @@ function normalizeTeam(name) {
   return n.trim();
 }
 
+// ── Country aliases (international soccer) ────────────────────────────────────
+// BFA uses short names ("USA"), Polymarket titles use official names
+// ("United States"), and PM slugs use FIFA trigrams ("sui" for Switzerland).
+// Keys are normalized BFA names; values are additional accepted strings.
+const COUNTRY_ALIASES = {
+  'usa': ['united states'],
+  'united states': ['usa'],
+  'belgium': ['bel'],
+  'switzerland': ['sui'],
+  'colombia': ['col'],
+  'egypt': ['egy'],
+  'argentina': ['arg'],
+  'england': ['eng'],
+  'mexico': ['mex'],
+  'morocco': ['mar'],
+  'france': ['fra'],
+  'norway': ['nor'],
+  'brazil': ['bra'],
+  'spain': ['esp'],
+  'portugal': ['por'],
+  'germany': ['ger'],
+  'netherlands': ['ned', 'holland'],
+  'italy': ['ita'],
+  'croatia': ['cro'],
+  'japan': ['jpn'],
+  'uruguay': ['uru'],
+  'canada': ['can'],
+  'australia': ['aus'],
+  'denmark': ['den'],
+  'poland': ['pol'],
+  'austria': ['aut'],
+  'turkey': ['tur'],
+  'south korea': ['kor', 'korea republic'],
+  'saudi arabia': ['ksa'],
+  'iran': ['irn'],
+  'ukraine': ['ukr'],
+  'serbia': ['srb'],
+  'scotland': ['sco'],
+  'wales': ['wal'],
+  'ivory coast': ['civ'],
+  'senegal': ['sen'],
+  'ghana': ['gha'],
+  'nigeria': ['nga'],
+  'cameroon': ['cmr'],
+  'ecuador': ['ecu'],
+  'paraguay': ['par'],
+  'panama': ['pan'],
+  'jordan': ['jor'],
+  'uzbekistan': ['uzb'],
+  'new zealand': ['nzl'],
+  'curacao': ['cuw'],
+  'haiti': ['hai'],
+  'cape verde': ['cpv'],
+  'south africa': ['rsa'],
+  'sweden': ['swe'],
+};
+
+// All accepted spellings for a team name (normalized): itself + any aliases.
+function teamAliasSet(name) {
+  const norm = normalizeTeam(name);
+  const out = new Set(norm ? [norm] : []);
+  for (const a of COUNTRY_ALIASES[norm] ?? []) out.add(a);
+  return out;
+}
+
+// Does the text mention this team under any accepted spelling? Aliases only
+// expand for country names in the table, so US-league teams are unaffected.
+function textHasTeam(text, name) {
+  const t = (text || '').toLowerCase();
+  for (const alias of teamAliasSet(name)) {
+    if (alias.length >= 3 && t.includes(alias)) return true;
+  }
+  return false;
+}
+
 // ── Bet sizing ────────────────────────────────────────────────────────────────
 
 function sizeBet(b, p, C, r, bkr) {
@@ -674,7 +779,7 @@ async function runScan(opts = {}) {
     const entries = await fetchBFAGames(slug);
     if (entries.length > 0) activeSports.push({ slug, entries });
   }
-  console.log(`Active sports: ${activeSports.map(s => s.slug.toUpperCase()).join(', ') || 'none'}\n`);
+  console.log(`Active sports: ${activeSports.map(s => sportLabel(s.slug)).join(', ') || 'none'}\n`);
 
   const allResults = [];
 
@@ -766,7 +871,7 @@ async function runScan(opts = {}) {
         allResults.push({
           date: startDate ? startDate.toLocaleDateString() : '',
           time: startDate ? startDate.toLocaleTimeString() : '',
-          sport: slug.toUpperCase(),
+          sport: sportLabel(slug),
           marketType: bfaEntry.marketType,
           line: bfaEntry.line != null ? String(bfaEntry.line) : '',
           awayTeam: bfaEntry.marketType === 'total' ? realAway : bfaEntry.awayTeam,
@@ -837,6 +942,7 @@ module.exports = {
   runScan, ALL_BFA_SLUGS,
   // Shared utilities for other scanners
   get, sleep, americanToImplied, normalizeTeam, CITY_MAP,
+  COUNTRY_ALIASES, teamAliasSet, textHasTeam, sportLabel,
   SPORT_SLUG_PREFIXES, matchPredexonMarket, searchPredexon,
   getPolyAskPrice, PREDEXON_API_KEY, RATE_LIMIT_MS,
 };

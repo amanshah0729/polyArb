@@ -97,6 +97,9 @@ type DepthInfo = {
   qualifies?: boolean;
   bonusCredit?: number;
   evAtMax?: number;
+  venue?: string | null;       // 'pmus' = real tradeable book; 'clob' = old Polymarket fallback (indicative only)
+  resolvedSlug?: string | null;
+  topPrice?: number | null;    // live top-of-book per-share price in intent coords
 } | null;
 
 function previewSize(arb: ArbPayload, scale: number, depth: DepthInfo): Preview {
@@ -107,7 +110,10 @@ function previewSize(arb: ArbPayload, scale: number, depth: DepthInfo): Preview 
 
   const bfaImplied = arb.bfaImplied ?? 0.5;
   const polyImplied = arb.polyImplied ?? 0.5;
-  const polyPrice = (arb.polySide === 'away' ? arb.polyAwayPrice : arb.polyHomePrice) ?? polyImplied;
+  // Prefer the live PM.US top-of-book over the scan-time quote (scan prices
+  // come from the old CLOB and can sit a venue apart from what actually fills).
+  const livePolyPrice = depth?.venue === 'pmus' && depth.topPrice != null && depth.topPrice > 0 ? depth.topPrice : null;
+  const polyPrice = livePolyPrice ?? (arb.polySide === 'away' ? arb.polyAwayPrice : arb.polyHomePrice) ?? polyImplied;
 
   let W = tierBase * scale;
   // Equal-payout hedge: W/bfaImplied = P/polyImplied  →  P = W × polyImplied/bfaImplied
@@ -134,7 +140,7 @@ function previewSize(arb: ArbPayload, scale: number, depth: DepthInfo): Preview 
   return { tier: tierLabel, bfaAmount: W, polyNotional: P, polyQty, polyPrice, profitPct, guaranteedPnl, depthClamped };
 }
 
-function buildRequest(arb: ArbPayload, scale: number) {
+function buildRequest(arb: ArbPayload, scale: number, livePolyPrice: number | null = null) {
   if (!arb.bfaSide || !arb.polySide) return { error: 'missing sides' };
   if (!arb.polyMarketSlug) return { error: 'missing poly slug' };
   if (arb.bfaEventId == null || arb.bfaFixtureId == null || arb.bfaMarketTypeInt == null) {
@@ -159,7 +165,10 @@ function buildRequest(arb: ArbPayload, scale: number) {
   const poly = {
     marketSlug: arb.polyMarketSlug,
     intent: polyAway ? arb.polyAwayIntent : arb.polyHomeIntent,
-    expectedPrice: polyAway ? arb.polyAwayPrice : arb.polyHomePrice,
+    // Live PM.US top-of-book beats the scan-time quote — the executor's drift
+    // guard compares against a fresh PM.US BBO, so a stale/wrong-venue price
+    // here systematically trips "poly_price_moved".
+    expectedPrice: livePolyPrice ?? (polyAway ? arb.polyAwayPrice : arb.polyHomePrice),
   };
   const meta = {
     strategy: arb.strategy,
@@ -201,12 +210,29 @@ export default function PlaceBetButton({ arb, hasArb }: { arb: ArbPayload | null
       feeMode: makerMode ? 'maker' : 'taker',
       lambda: String(LAMBDA),
     });
+    // Name context lets the server resolve the real PM.US market (Predexon
+    // slugs often differ) instead of falling back to the old CLOB book.
+    if (arb.awayTeam) qs.set('awayTeam', arb.awayTeam);
+    if (arb.homeTeam) qs.set('homeTeam', arb.homeTeam);
+    if (arb.sport) qs.set('sport', arb.sport);
+    if (arb.date) qs.set('date', arb.date);
+    if (arb.marketType) qs.set('marketType', arb.marketType);
+    if (arb.line != null && arb.line !== '') qs.set('line', String(arb.line));
+    if (arb.isSeries) qs.set('isSeries', '1');
+    const polyTeam = arb.polySide === 'away' ? arb.awayTeam : arb.homeTeam;
+    if (polyTeam) qs.set('polyTeam', polyTeam);
     fetch(`/api/poly-depth?${qs.toString()}`)
       .then((r) => r.ok ? r.json() : null)
       .then((data) => {
         if (cancelled) return;
-        if (data && data.max && Number.isFinite(data.max.maxShares)) setDepth(data.max as NonNullable<DepthInfo>);
-        else setDepth(null);
+        if (data && data.max && Number.isFinite(data.max.maxShares)) {
+          setDepth({
+            ...(data.max as NonNullable<DepthInfo>),
+            venue: data.venue ?? null,
+            resolvedSlug: data.resolvedSlug ?? null,
+            topPrice: typeof data.topPrice === 'number' ? data.topPrice : null,
+          });
+        } else setDepth(null);
       })
       .catch(() => { if (!cancelled) setDepth(null); })
       .finally(() => { if (!cancelled) setDepthLoading(false); });
@@ -225,7 +251,8 @@ export default function PlaceBetButton({ arb, hasArb }: { arb: ArbPayload | null
     );
   }
 
-  const builtBase = buildRequest(arb, scale);
+  const livePolyPrice = depth?.venue === 'pmus' && depth.topPrice != null && depth.topPrice > 0 ? depth.topPrice : null;
+  const builtBase = buildRequest(arb, scale, livePolyPrice);
   const built = 'error' in builtBase ? builtBase : { ...builtBase, execMode: makerMode ? 'maker' : 'ioc' };
 
   // ── P&L chain: dry → after fees → EV (fees + rollover credit) ──
@@ -399,7 +426,7 @@ export default function PlaceBetButton({ arb, hasArb }: { arb: ArbPayload | null
     if (tierBase <= 0) return null;
     const bfaImplied = arb.bfaImplied ?? 0.5;
     const polyImplied = arb.polyImplied ?? 0.5;
-    const polyPrice = (arb.polySide === 'away' ? arb.polyAwayPrice : arb.polyHomePrice) ?? polyImplied;
+    const polyPrice = livePolyPrice ?? (arb.polySide === 'away' ? arb.polyAwayPrice : arb.polyHomePrice) ?? polyImplied;
     if (polyPrice <= 0 || bfaImplied <= 0) return null;
     // polyQty(scale) = tierBase * scale * (polyImplied / bfaImplied) / polyPrice  (pre-clamp)
     // Solve for scale where polyQty == maxShares:
@@ -411,7 +438,7 @@ export default function PlaceBetButton({ arb, hasArb }: { arb: ArbPayload | null
         const tierBase = tierForCost(arb.bestCost ?? 1.5)?.bfaAmount ?? 0;
         const bfaImplied = arb.bfaImplied ?? 0.5;
         const polyImplied = arb.polyImplied ?? 0.5;
-        const polyPrice = (arb.polySide === 'away' ? arb.polyAwayPrice : arb.polyHomePrice) ?? polyImplied;
+        const polyPrice = livePolyPrice ?? (arb.polySide === 'away' ? arb.polyAwayPrice : arb.polyHomePrice) ?? polyImplied;
         const rawNeeded = (depth.maxShares * polyPrice * bfaImplied) / (tierBase * polyImplied);
         return rawNeeded > 3 + 1e-9; // tier ceiling hit before reaching maxShares
       })()
@@ -455,6 +482,14 @@ export default function PlaceBetButton({ arb, hasArb }: { arb: ArbPayload | null
             <span className={depth.evAtMax >= 0 ? 'text-[#22c55e]' : 'text-[#f87171]'}>
               {fmtPnl(depth.evAtMax)}
             </span>
+          </span>
+        )}
+        {depth.venue === 'clob' && (
+          <span
+            className="ml-1.5 px-1.5 py-0.5 rounded bg-[rgba(251,191,36,0.15)] text-[#fbbf24]"
+            title="This book came from the old Polymarket CLOB fallback (PM.US market didn't resolve) — prices are indicative only and NOT what your order will fill against."
+          >
+            ⚠ CLOB fallback
           </span>
         )}
       </span>

@@ -3,13 +3,20 @@
 // matching PM.US market via tiered lookup, scored against `market.question`
 // and `market.slug` rather than playing slug-encoding telephone with Predexon.
 
-const { normalizeTeam } = require('../scripts/bfagaming/scan');
+const { normalizeTeam, teamAliasSet } = require('../scripts/bfagaming/scan');
 
 // Predexon league prefix → PM.US sport tagId. From `sports.list()`. Series-
 // winner futures (tec- prefix) live under the **regular** sport tag, not a
 // separate series tag, so we always search the regular tag.
-const TAG_BY_PREFIX = { ufc: 9, mma: 9, nba: 5, nhl: 7, nfl: 1, mlb: 4, epl: 17, ucl: 18, mls: 10 };
-const TAG_BY_SPORT  = { UFC: 9, MMA: 9, NBA: 5, NHL: 7, NFL: 1, MLB: 4, EPL: 17, UCL: 18, MLS: 10 };
+const TAG_BY_PREFIX = {
+  ufc: 9, mma: 9, nba: 5, nhl: 7, nfl: 1, mlb: 4, epl: 17, ucl: 18, mls: 10,
+  fifwc: 326, fwc: 326, // FIFA World Cup (fifwc- = Predexon, fwc- = PM.US slugs)
+};
+const TAG_BY_SPORT  = {
+  UFC: 9, MMA: 9, NBA: 5, NHL: 7, NFL: 1, MLB: 4, EPL: 17, UCL: 18, MLS: 10,
+  FWC: 326, NCAAF: 6, WNBA: 94,
+  LALIGA: 27, SERIEA: 26, // (no PM.US Ligue 1 tag as of 2026-07 — resolver falls back to slug tiers)
+};
 
 // PM.US slug prefixes per market type:
 //   aec- = moneyline (binary, two-outcome)
@@ -52,6 +59,11 @@ function _teamMatchTokens(name) {
   const mascotNorm = _normName(normalizeTeam(name));
   const mascotParts = mascotNorm.split(/\s+/).filter(Boolean);
   if (mascotParts.length) out.add(mascotParts[mascotParts.length - 1]);
+  // Country aliases: "USA" ↔ "united states", FIFA trigrams ("sui") — PM.US
+  // World Cup questions/slugs use codes ("USA vs BEL", tsc-fwc-usa-bel-…).
+  for (const alias of teamAliasSet(name)) {
+    if (alias.length >= 3) out.add(alias);
+  }
   return [...out];
 }
 
@@ -200,12 +212,22 @@ function _scoreCandidate(market, ctx) {
   return score;
 }
 
-async function _tier0_direct(client, slug) {
-  try { await client.markets.retrieveBySlug(slug); return slug; }
-  catch { return null; }
+// "Not found" is a legitimate miss; anything else (5xx, timeouts, "server was
+// unable to process") is a transport error — a null result caused by one must
+// NOT be negative-cached, or a transient PM.US hiccup blocks the market for an
+// hour and every Place attempt reports a bogus "unsupported".
+const NOT_FOUND_RE = /not.found/i;
+
+function _recordErr(errs, tier, e) {
+  if (!NOT_FOUND_RE.test(e?.message || '')) errs.push(`${tier}: ${e?.message || e}`);
 }
 
-async function _tier1_event(client, slug, ctx) {
+async function _tier0_direct(client, slug, errs) {
+  try { await client.markets.retrieveBySlug(slug); return slug; }
+  catch (e) { _recordErr(errs, 'tier0', e); return null; }
+}
+
+async function _tier1_event(client, slug, ctx, errs) {
   try {
     const resp = await client.events.retrieveBySlug(slug);
     const markets = resp?.event?.markets || [];
@@ -221,29 +243,31 @@ async function _tier1_event(client, slug, ctx) {
       return aec?.slug || markets[0]?.slug || null;
     }
     return null;
-  } catch { return null; }
+  } catch (e) { _recordErr(errs, 'tier1', e); return null; }
 }
 
-async function _tier2_listByTag(client, ctx) {
+async function _tier2_listByTag(client, ctx, errs) {
   if (!ctx.tagId || !ctx.awayTokens?.length || !ctx.homeTokens?.length) return null;
   let best = null;
-  // Paginate — PM.US returns up to 500 per page; sport tags can have more.
-  for (let offset = 0; offset < 5000; offset += 500) {
-    const r = await client.markets.list({
-      limit: 500, tagIds: [ctx.tagId], offset, active: true, closed: false,
-    });
-    const ms = r?.markets || [];
-    if (!ms.length) break;
-    for (const m of ms) {
-      const s = _scoreCandidate(m, ctx);
-      if (s != null && (!best || s > best.score)) best = { score: s, slug: m.slug };
+  try {
+    // Paginate — PM.US returns up to 500 per page; sport tags can have more.
+    for (let offset = 0; offset < 5000; offset += 500) {
+      const r = await client.markets.list({
+        limit: 500, tagIds: [ctx.tagId], offset, active: true, closed: false,
+      });
+      const ms = r?.markets || [];
+      if (!ms.length) break;
+      for (const m of ms) {
+        const s = _scoreCandidate(m, ctx);
+        if (s != null && (!best || s > best.score)) best = { score: s, slug: m.slug };
+      }
+      if (ms.length < 500) break;
     }
-    if (ms.length < 500) break;
-  }
+  } catch (e) { _recordErr(errs, 'tier2', e); }
   return best?.slug || null;
 }
 
-async function _tier3_alphaTokens(client, slug) {
+async function _tier3_alphaTokens(client, slug, errs) {
   // Last-resort slug-substring match (with alpha-strip). For non-team markets
   // (politics, weather) where we have no names. Mirrors the legacy resolver.
   const m = String(slug || '').match(/^([a-z]+)-(.+)-(\d{4}-\d{2}-\d{2})$/i);
@@ -263,7 +287,7 @@ async function _tier3_alphaTokens(client, slug) {
       if (!tokens.every(tok => s.includes(tok))) continue;
       return mk.slug;
     }
-  } catch { /* swallow */ }
+  } catch (e) { _recordErr(errs, 'tier3', e); }
   return null;
 }
 
@@ -301,8 +325,10 @@ async function resolveMarket(client, opts = {}) {
     tagId: _tagFor({ sport: opts.sport, slug }),
   };
 
+  const errs = [];
+
   // Tier 0 — slug as-is
-  const t0 = await _tier0_direct(client, slug);
+  const t0 = await _tier0_direct(client, slug, errs);
   if (t0) {
     // Even if direct hit succeeds, verify it doesn't violate the cross-type
     // guard (e.g. Predexon slug accidentally points to a series market when
@@ -320,19 +346,37 @@ async function resolveMarket(client, opts = {}) {
   }
 
   // Tier 1 — event lookup
-  const t1 = await _tier1_event(client, slug, ctx);
+  const t1 = await _tier1_event(client, slug, ctx, errs);
   if (t1) { _setPos(cacheKey, t1); return { resolvedSlug: t1, source: 'event' }; }
 
   // Tier 2 — name-based listing
-  const t2 = await _tier2_listByTag(client, ctx);
+  const t2 = await _tier2_listByTag(client, ctx, errs);
   if (t2) { _setPos(cacheKey, t2); return { resolvedSlug: t2, source: 'name' }; }
 
   // Tier 3 — alpha-stripped token fallback (slug-only callers)
-  const t3 = await _tier3_alphaTokens(client, slug);
+  const t3 = await _tier3_alphaTokens(client, slug, errs);
   if (t3) { _setPos(cacheKey, t3); return { resolvedSlug: t3, source: 'tokens' }; }
 
-  _setNeg(cacheKey);
+  // Only cache the miss if every tier genuinely found nothing. A miss caused
+  // by an API error must stay retryable.
+  if (errs.length === 0) {
+    _setNeg(cacheKey);
+  } else if (!_warnedRecently(slug)) {
+    console.warn(`[matcher] no match for ${slug} but lookups errored — not neg-caching (${errs[0]})`);
+  }
   return null;
+}
+
+// Rate-limit the errored-miss warning to once per slug per hour — slug-only
+// callers (depth/BBO) re-resolve on every page load and PM.US reports plain
+// not-found as "server was unable to process", so this fires constantly.
+const _warnLog = new Map();
+function _warnedRecently(slug) {
+  const now = Date.now();
+  const last = _warnLog.get(slug) || 0;
+  if (now - last < 60 * 60 * 1000) return true;
+  _warnLog.set(slug, now);
+  return false;
 }
 
 module.exports = {

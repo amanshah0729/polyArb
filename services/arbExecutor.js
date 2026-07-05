@@ -128,6 +128,32 @@ async function executeArb({ bfa, poly, meta = {}, opts = {} }) {
     return final;
   }
 
+  // Re-validate the arb at the LIVE ask. The drift check above only confirms the ask
+  // hasn't moved past the *expected* price — but if expectedPrice itself was already a
+  // drifted (post-scan) price, bfaImplied + actualAsk can be out of any arb tier while
+  // drift ≈ 0. Recompute the cost from the live ask and refuse to fire an out-of-tier
+  // "arb" (this is what let a 42%-scanned row execute at 44%). Protects every caller,
+  // including the auto path that passes scan-row meta straight through.
+  const { tierForCost } = require('./betSizing');
+  const liveBfaImplied = Number(meta.bfaImplied);
+  if (Number.isFinite(liveBfaImplied) && liveBfaImplied > 0 && liveBfaImplied < 1) {
+    // Fee-aware: charge the PM.US taker fee (or credit the maker rebate) into the cost
+    // the gate checks, so ask + fee + bfaImplied is what's compared against the arb tier.
+    const gateFeeMode = opts.execMode === 'maker' ? 'maker' : 'taker';
+    const liveFee = polyBook.effectiveFeeAdder(actualAsk, gateFeeMode);
+    const liveCost = liveBfaImplied + actualAsk + liveFee;
+    if (!tierForCost(liveCost)) {
+      const final = {
+        attemptId, outcome: 'false_arb', reason: 'arb_gone_live_price',
+        liveCost, actualAsk, liveFee, bfaImplied: liveBfaImplied,
+        scannedCost: Number(meta.scannedCost ?? meta.bestCost),
+        scannedPolyImplied: Number(meta.scannedPolyImplied ?? meta.polyImplied), ...meta,
+      };
+      eventLog.finalize(final);
+      return final;
+    }
+  }
+
   const execMode = opts.execMode === 'maker' ? 'maker' : 'ioc';
   const feeMode = execMode === 'maker' ? 'maker' : 'taker';
 
@@ -198,11 +224,19 @@ async function executeArb({ bfa, poly, meta = {}, opts = {} }) {
     return final;
   }
 
-  // Verify fill matches expected
-  const fillSlippage = (polyBuy.avgPx ?? polyBuy.limitPrice) - poly.expectedPrice;
+  // Verify fill matches expected. SDK avgPx is ALWAYS long-side coords; for
+  // BUY_SHORT the price actually paid per share is 1 − avgPx. Comparing raw
+  // long-side avgPx against the short-side expectedPrice flags clean short
+  // fills as massive slippage and unwinds them.
+  const rawFillPx = polyBuy.avgPx ?? polyBuy.limitPrice;
+  const effectiveFillPx = poly.intent === 'ORDER_INTENT_BUY_SHORT' && rawFillPx != null
+    ? 1 - rawFillPx
+    : rawFillPx;
+  polyBuy.effectivePx = effectiveFillPx;
+  const fillSlippage = effectiveFillPx - poly.expectedPrice;
   eventLog.polyFilled({
     attemptId, marketSlug: poly.marketSlug, orderId: polyBuy.orderId,
-    filledQty: polyBuy.filledQty, avgPx: polyBuy.avgPx, notional: polyBuy.notional,
+    filledQty: polyBuy.filledQty, avgPx: polyBuy.avgPx, effectivePx: effectiveFillPx, notional: polyBuy.notional,
     expectedPrice: poly.expectedPrice, fillSlippage,
   });
 
@@ -243,7 +277,7 @@ async function executeArb({ bfa, poly, meta = {}, opts = {} }) {
     const guaranteedPnl = meta.guaranteedPnl ?? null;
     const final = {
       attemptId, outcome: 'filled_both',
-      polyBuy: { orderId: polyBuy.orderId, filledQty: polyBuy.filledQty, avgPx: polyBuy.avgPx },
+      polyBuy: { orderId: polyBuy.orderId, filledQty: polyBuy.filledQty, avgPx: polyBuy.avgPx, effectivePx: polyBuy.effectivePx },
       bfa: { idTransaction: bfaRes.idTransaction, amount: bfa.amount, price: bfa.price },
       guaranteedPnl, ...meta,
     };
@@ -262,7 +296,9 @@ async function executeArb({ bfa, poly, meta = {}, opts = {} }) {
 
   const unwind = await polyTrader.unwindLadder({
     marketSlug: poly.marketSlug, intent: poly.intent,
-    entryPrice: polyBuy.avgPx ?? poly.expectedPrice,
+    // unwindLadder expects long-side coords (SDK avgPx convention); the
+    // expectedPrice fallback is in intent coords, so convert for shorts.
+    entryPrice: polyBuy.avgPx ?? (poly.intent === 'ORDER_INTENT_BUY_SHORT' ? 1 - poly.expectedPrice : poly.expectedPrice),
     quantity: polyBuy.filledQty,
   });
   eventLog.unwind({ attemptId, reason: 'bfa_failed', ...unwind });

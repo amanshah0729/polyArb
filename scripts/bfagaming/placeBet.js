@@ -21,34 +21,49 @@ function assertNotInCooldown() {
   }
 }
 
-async function getBalance() {
+// Authenticated GET against the BFA API with one automatic retry on 401.
+// A locally-unexpired token can still be rejected server-side (session revoked,
+// clock skew, stale mint), which surfaced as "history 401: invalid token" on the
+// dashboard. On a 401 we force a fresh login and retry once so it self-heals
+// instead of staying broken until a manual re-auth.
+async function bfaGet(pathAndQuery, endpoint) {
   assertNotInCooldown();
   const ctx = await getContext();
-  const token = await getAccessToken();
-  const playerId = parseInt(process.env.BFA_PLAYER_ID, 10);
-  const res = await ctx.request.get(`${API}/balance/api/GetPlayerBalanceByPlayerId?playerId=${playerId}`, {
-    headers: { authorization: `Bearer ${token}` },
-  });
+  const doReq = (token) =>
+    ctx.request.get(`${API}${pathAndQuery}`, { headers: { authorization: `Bearer ${token}` } });
+
+  let res = await doReq(await getAccessToken());
+  if (res.status() === 401) {
+    // Token was rejected despite looking locally-valid — mint a fresh one and retry.
+    res = await doReq(await getAccessToken({ force: true }));
+  }
   if (!res.ok()) {
-    maybeTriggerCooldown(res.status(), 'balance');
-    throw new Error(`balance ${res.status()}: ${(await res.text()).slice(0, 200)}`);
+    maybeTriggerCooldown(res.status(), endpoint);
+    throw new Error(`${endpoint} ${res.status()}: ${(await res.text()).slice(0, 200)}`);
   }
   return res.json();
 }
 
-async function getOpenBets() {
-  assertNotInCooldown();
-  const ctx = await getContext();
-  const token = await getAccessToken();
+async function getBalance() {
   const playerId = parseInt(process.env.BFA_PLAYER_ID, 10);
-  const res = await ctx.request.get(`${API}/history/api/GetPlayerOpenBets?playerId=${playerId}`, {
-    headers: { authorization: `Bearer ${token}` },
-  });
-  if (!res.ok()) {
-    maybeTriggerCooldown(res.status(), 'openBets');
-    throw new Error(`openBets ${res.status()}: ${(await res.text()).slice(0, 200)}`);
-  }
-  return res.json();
+  return bfaGet(`/balance/api/GetPlayerBalanceByPlayerId?playerId=${playerId}`, 'balance');
+}
+
+async function getOpenBets() {
+  const playerId = parseInt(process.env.BFA_PLAYER_ID, 10);
+  return bfaGet(`/history/api/GetPlayerOpenBets?playerId=${playerId}`, 'openBets');
+}
+
+// Settled wager history. BFA's UI calls GetPlayerHistory with a date range;
+// wagers[] carries { id, description, placedDate, settledDate, result: 'WIN'|'LOSE',
+// risk, win, amount } where amount is the signed cash delta.
+async function getSettledHistory({ startDate = '2026-01-01', endDate } = {}) {
+  const playerId = parseInt(process.env.BFA_PLAYER_ID, 10);
+  const end = endDate ?? new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  return bfaGet(
+    `/history/api/GetPlayerHistory?playerId=${playerId}&startDate=${startDate}&endDate=${end}`,
+    'history',
+  );
 }
 
 // Observed constant for player 412469 across multiple captures (Magic spread + Nationals ML).
@@ -150,7 +165,7 @@ async function placeBet({
   return { status, body, idTransaction: idTx, placed, balanceBefore, balanceAfter, firedKey };
 }
 
-module.exports = { placeBet, getBalance, getOpenBets, cooldown, firedLog };
+module.exports = { placeBet, getBalance, getOpenBets, getSettledHistory, cooldown, firedLog };
 
 // CLI: auth + balance smoke test only. No bet placed.
 if (require.main === module) {

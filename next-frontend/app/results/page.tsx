@@ -5,6 +5,7 @@ import ResultsClient from './ResultsClient';
 import RerunButton from './RerunButton';
 import TabBar from './TabBar';
 import BetsHistoryPanel from './BetsHistoryPanel';
+import PnlPanel from './PnlPanel';
 import StatsPanel from './StatsPanel';
 import PlaceBetButton, { type ArbPayload } from './PlaceBetButton';
 
@@ -746,6 +747,10 @@ async function BetFastContent() {
           loadingLabel="Scanning..."
         />
       </div>
+
+      <Suspense fallback={<div className="px-8 py-3 text-xs text-[#6b7280] bg-[#0b1220] border-b border-[rgba(255,255,255,0.08)]">loading strategy P&amp;L…</div>}>
+        <PnlPanel />
+      </Suspense>
 
       {notifierUrl && <StatsPanel notifierUrl={notifierUrl} />}
 

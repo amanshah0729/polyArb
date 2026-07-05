@@ -27,7 +27,7 @@ const { sizeArb } = require('./betSizing');
 const polyTrader = require('./polyTrader');
 const polyBook = require('./polyBook');
 const makerShadow = require('./makerShadow');
-const { getBalance } = require('../scripts/bfagaming/placeBet');
+const { getBalance, getOpenBets, getSettledHistory } = require('../scripts/bfagaming/placeBet');
 
 const OUT_DIR = path.join(__dirname, '..', 'outputs', 'bfagaming');
 fs.mkdirSync(OUT_DIR, { recursive: true });
@@ -51,14 +51,47 @@ if (!NOTIFICATION_EMAIL) { console.error('NOTIFICATION_EMAIL not set'); process.
 const resend = new Resend(RESEND_API_KEY);
 
 // ── Dedup ─────────────────────────────────────────────────────────────────────
-// Key: "awayTeam|homeTeam|strategy" → timestamp of last notification
+// Key: stable game+market identity → timestamp of last notification.
 // Clears entries older than 12 hours so games can re-alert across days.
+//
+// The key deliberately does NOT use `strategy`: that string is rebuilt every scan
+// from the current cheapest bet, so it embeds (a) the line via mtLabel and (b) the
+// BFA/Poly direction (option1 vs option2). Both flip as prices/lines drift, which
+// minted a fresh key for the same game and re-emailed it. We normalize team order
+// (kills the direction flip) and key on marketType+line from the row fields, so a
+// game only re-alerts when the line genuinely moves — not on every tick or flip.
+//
+// Persisted to disk so a pm2 restart doesn't wipe the map and re-alert everything.
 
 const notified = new Map();
 const DEDUP_TTL_MS = 12 * 60 * 60 * 1000;
+const DEDUP_PATH = path.join(OUT_DIR, 'notified.json');
+
+// /pnl response cache (BFA browser context + full activity pull are slow)
+const pnlCache = { body: null, at: 0 };
 
 function dedupKey(result) {
-  return `${result.awayTeam}|${result.homeTeam}|${result.strategy}`;
+  const teams = [result.awayTeam, result.homeTeam].sort().join('|');
+  return `${result.sport}|${teams}|${result.marketType}|${result.line ?? ''}`;
+}
+
+function loadDedup() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(DEDUP_PATH, 'utf8'));
+    const now = Date.now();
+    for (const [key, ts] of Object.entries(raw)) {
+      if (now - ts <= DEDUP_TTL_MS) notified.set(key, ts);
+    }
+    console.log(`Loaded ${notified.size} live dedup entries from disk.`);
+  } catch { /* no prior state — first run */ }
+}
+
+function saveDedup() {
+  try {
+    fs.writeFileSync(DEDUP_PATH, JSON.stringify(Object.fromEntries(notified)), 'utf8');
+  } catch (e) {
+    console.warn(`dedup persist failed: ${e.message}`);
+  }
 }
 
 function alreadyNotified(result) {
@@ -81,6 +114,7 @@ function pruneDedup() {
   for (const [key, ts] of notified) {
     if (now - ts > DEDUP_TTL_MS) notified.delete(key);
   }
+  saveDedup();
 }
 
 // ── True P&L after Polymarket taker fees (pre-bonus) ─────────────────────────
@@ -257,7 +291,15 @@ async function tick() {
   console.log(`Scan starting at ${new Date().toLocaleString()}`);
 
   try {
-    const results = await runScan();
+    // Watchdog: a hung scan (dead socket, wedged API) must never freeze the
+    // loop — `scanning` stays true and every future tick skips. Abandon the
+    // scan after 12 min; per-request timeouts inside runScan make the orphaned
+    // promise die on its own shortly after.
+    const SCAN_TIMEOUT_MS = 12 * 60 * 1000;
+    const results = await Promise.race([
+      runScan(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error(`scan watchdog: exceeded ${SCAN_TIMEOUT_MS / 60000} min — abandoning`)), SCAN_TIMEOUT_MS)),
+    ]);
     // Decorate each row with after-fee P&L so the frontend and email filter
     // share one source of truth.
     for (const r of results) Object.assign(r, computeTruePnl(r));
@@ -389,6 +431,18 @@ async function handleExecute(req, res, cors) {
   const bestCost = Number(meta.bestCost);
   const bfaImplied = Number(meta.bfaImplied);
   const polyImplied = Number(meta.polyImplied);
+  // Size and gate on the LIVE executable price, NOT the scanned row. meta.bestCost /
+  // meta.polyImplied are a snapshot from scan and can be stale — the Poly ask drifts
+  // between scan and click. expectedPrice is the live ask the frontend just fetched.
+  // Sizing on the stale cost tiers a drifted bet as a deeper arb than it is: that's how
+  // a row shown at 42% got sized as a deep-arb and executed at 44% (out of arb tier).
+  const livePolyPrice = Number(polyIn.expectedPrice);
+  const livePriceOk = Number.isFinite(livePolyPrice) && livePolyPrice > 0;
+  // Fee-aware: include the PM.US taker fee (or maker rebate) in the cost the gate sees,
+  // so what you're charged — ask + fee — is what's checked against the arb tier.
+  const liveFee = livePriceOk ? polyBook.effectiveFeeAdder(livePolyPrice, feeMode) : 0;
+  const liveCost = (Number.isFinite(bfaImplied) && livePriceOk) ? bfaImplied + livePolyPrice + liveFee : bestCost;
+  const livePolyImplied = livePriceOk ? livePolyPrice : polyImplied;
   // Fetch Poly book so sizing can depth-clamp before we place anything.
   let depthRaw = null;
   try {
@@ -398,8 +452,8 @@ async function handleExecute(req, res, cors) {
     console.warn(`[execute] depth fetch failed for ${polyIn.marketSlug}: ${e.message}`);
   }
   const sized = sizeArb({
-    bestCost, bfaImplied, polyImplied,
-    polyPrice: Number(polyIn.expectedPrice),
+    bestCost: liveCost, bfaImplied, polyImplied: livePolyImplied,
+    polyPrice: livePolyPrice,
     availableBalance: balance,
     scaleFactor: Number(scaleFactor),
     polyBook: depthRaw,
@@ -407,9 +461,13 @@ async function handleExecute(req, res, cors) {
     feeMode,
   });
   if (!sized) {
-    const tier = require('./betSizing').tierForCost(bestCost);
-    if (!tier) return json(400, { error: 'cost_out_of_tier', bestCost });
-    return json(400, { error: 'below_bfa_minimum', hint: 'scaled BFA bet < $5 (BFA min) — raise scale or check balance', bestCost, balance });
+    const tier = require('./betSizing').tierForCost(liveCost);
+    if (!tier) return json(409, {
+      error: 'arb_gone',
+      hint: 'live Poly ask drifted out of the arb tier since the row was scanned — not placing',
+      scannedCost: bestCost, liveCost, scannedPolyImplied: polyImplied, livePolyPrice,
+    });
+    return json(400, { error: 'below_bfa_minimum', hint: 'scaled BFA bet < $5 (BFA min) — raise scale or check balance', bestCost: liveCost, balance });
   }
 
   if (sized.bfaAmount > MAX_LEG_NOTIONAL) return json(400, { error: 'bfa_leg_too_large', bfaAmount: sized.bfaAmount });
@@ -439,7 +497,12 @@ async function handleExecute(req, res, cors) {
   try {
     const result = await executeArb({
       bfa, poly,
-      meta: { ...meta, sizing: sized, availableBalance: balance, execMode },
+      // Log the live cost we actually gated/sized on; keep the scanned values for audit.
+      meta: {
+        ...meta, bestCost: liveCost, polyImplied: livePolyImplied,
+        scannedCost: bestCost, scannedPolyImplied: polyImplied,
+        sizing: sized, availableBalance: balance, execMode,
+      },
       opts: { execMode, iocFallback: !!iocFallbackIn },
     });
     return json(200, { ok: true, sizing: sized, result });
@@ -473,22 +536,56 @@ const server = http.createServer(async (req, res) => {
     const bfaImpliedRaw = u.searchParams.get('bfaImplied');
     const feeModeRaw = u.searchParams.get('feeMode');
     const feeMode = feeModeRaw === 'maker' ? 'maker' : feeModeRaw === 'none' ? 'none' : 'taker';
-    const lambdaRaw = Number(u.searchParams.get('lambda'));
+    const lambdaStr = u.searchParams.get('lambda');
+    const lambdaRaw = lambdaStr != null && lambdaStr !== '' ? Number(lambdaStr) : NaN;
     const lambda = Number.isFinite(lambdaRaw) && lambdaRaw >= 0 ? lambdaRaw : undefined;
     if (!slug || !intent) {
       res.writeHead(400, { 'Content-Type': 'application/json', ...cors });
       return res.end(JSON.stringify({ error: 'missing slug or intent' }));
     }
     try {
-      const d = await polyTrader.getDepth(slug);
+      // Rich resolution first when the caller supplies name context — the
+      // Predexon slug often isn't a PM.US slug (fighter/team abbreviations
+      // differ), and slug-only resolution can silently fall back to the old
+      // CLOB book, which is not tradeable via the polymarket-us SDK.
+      let depthSlug = slug;
+      const awayTeam = u.searchParams.get('awayTeam');
+      const homeTeam = u.searchParams.get('homeTeam');
+      if (awayTeam && homeTeam) {
+        try {
+          const matcher = require('./marketMatcher');
+          const r = await matcher.resolveMarket(polyTrader.client(), {
+            slug,
+            sport: u.searchParams.get('sport') || undefined,
+            date: u.searchParams.get('date') || undefined,
+            awayTeam, homeTeam,
+            polyTeam: u.searchParams.get('polyTeam') || undefined,
+            isSeries: u.searchParams.get('isSeries') === '1',
+            marketType: u.searchParams.get('marketType') || undefined,
+            line: u.searchParams.get('line') || undefined,
+          });
+          if (r?.resolvedSlug) depthSlug = r.resolvedSlug;
+        } catch (e) {
+          console.warn(`[depth] rich resolve failed for ${slug}: ${e.message}`);
+        }
+      }
+      const d = await polyTrader.getDepth(depthSlug);
       const bfaImplied = Number(bfaImpliedRaw);
       const mp = Number.isFinite(bfaImplied) && bfaImplied > 0 && bfaImplied < 1
         ? polyBook.maxProfitableSize({ book: d.raw, intent, bfaImplied, feeMode, ...(lambda != null ? { lambda } : {}) })
         : null;
+      // Top-of-book per-share price in intent coords (what you'd pay right now):
+      // BUY_LONG consumes offers; BUY_SHORT consumes bids at (1 − px).
+      const topPrice = intent === 'ORDER_INTENT_BUY_SHORT'
+        ? (d.bids?.[0]?.px != null ? 1 - d.bids[0].px : null)
+        : (d.offers?.[0]?.px ?? null);
       res.writeHead(200, { 'Content-Type': 'application/json', ...cors });
       return res.end(JSON.stringify({
         slug, intent, bfaImplied: Number.isFinite(bfaImplied) ? bfaImplied : null,
         feeMode,
+        resolvedSlug: d.marketSlug ?? depthSlug,
+        venue: d.venue ?? null,
+        topPrice,
         bids: d.bids, offers: d.offers, max: mp,
       }));
     } catch (e) {
@@ -544,7 +641,9 @@ const server = http.createServer(async (req, res) => {
           const american = e.bfa.price;
           const bfaImplied = americanToImplied(american);
           const qty = Number(e.polyBuy.filledQty) || 0;
-          const avgPx = Number(e.polyBuy.avgPx) || 0;
+          // effectivePx = intent-coord price actually paid (avgPx is long-side;
+          // wrong for BUY_SHORT fills). Older events only have avgPx.
+          const avgPx = Number(e.polyBuy.effectivePx ?? e.polyBuy.avgPx) || 0;
           const polyNotional = qty * avgPx;
 
           // Polymarket.US fee. Maker gets a rebate (negative fee).
@@ -609,6 +708,220 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(500, { 'Content-Type': 'application/json', ...cors });
       return res.end(JSON.stringify({ error: e.message }));
     }
+  } else if (req.url?.startsWith('/pnl')) {
+    // Combined cash P&L across both venues for the arb strategy. Pure cash —
+    // deliberately NO rollover/bonus credit here.
+    //   Poly side: PM.US activities filtered to markets our app traded
+    //   (matched by order IDs recorded in the event log).
+    //   BFA side: settled wager history + open bets from the BFA API.
+    try {
+      const now = Date.now();
+      if (pnlCache.body && now - pnlCache.at < 60_000) {
+        res.writeHead(200, { 'Content-Type': 'application/json', ...cors });
+        return res.end(pnlCache.body);
+      }
+
+      // 1. Our Poly order IDs, from the full event log
+      const events = eventLog.readTypes(['poly_filled', 'final', 'unwind'], 0);
+      const ourOrderIds = new Set();
+      const walk = (v) => {
+        if (!v || typeof v !== 'object') return;
+        for (const [k, val] of Object.entries(v)) {
+          if (/orderid/i.test(k) && typeof val === 'string' && val) ourOrderIds.add(val);
+          else if (val && typeof val === 'object') walk(val);
+        }
+      };
+      events.forEach(walk);
+
+      // 2. PM.US activities → arb market slugs → per-slug cash flows
+      const num = (v) => { const n = Number(v?.value ?? v); return Number.isFinite(n) ? n : 0; };
+      const acts = await polyTrader.listActivities();
+      const tradeActs = acts.filter((a) => a.type === 'ACTIVITY_TYPE_TRADE' && a.trade?.aggressorExecution?.order);
+      const arbSlugs = new Set();
+      for (const a of tradeActs) {
+        const o = a.trade.aggressorExecution.order;
+        if (o.id && ourOrderIds.has(o.id) && o.marketSlug) arbSlugs.add(o.marketSlug);
+      }
+
+      const bySlug = new Map();
+      const rowFor = (slug, metaSrc) => {
+        if (!bySlug.has(slug)) {
+          bySlug.set(slug, {
+            slug,
+            title: metaSrc?.title ?? slug,
+            outcome: metaSrc?.outcome ?? null,
+            trades: [], cash: 0, fees: 0, resolved: false, resolutionCash: null,
+            firstTime: null,
+          });
+        }
+        return bySlug.get(slug);
+      };
+
+      const feeCountedOrders = new Set();
+      for (const a of tradeActs) {
+        const ex = a.trade.aggressorExecution;
+        const o = ex.order;
+        if (!o.marketSlug || !arbSlugs.has(o.marketSlug)) continue;
+        const px = num(ex.lastPx);
+        const sh = Number(ex.lastShares) || 0;
+        let fee = ex.commissionNotionalCollected != null ? num(ex.commissionNotionalCollected) : null;
+        if (fee == null) {
+          // Fall back to the order-level total, counted once per order
+          fee = feeCountedOrders.has(o.id) ? 0 : num(o.commissionNotionalTotalCollected);
+          feeCountedOrders.add(o.id);
+        }
+        const isBuy = o.intent === 'ORDER_INTENT_BUY_LONG' || o.intent === 'ORDER_INTENT_BUY_SHORT';
+        const isShort = typeof o.intent === 'string' && o.intent.includes('SHORT');
+        const perShare = isShort ? 1 - px : px;   // price actually paid/received per share
+        const cash = (isBuy ? -1 : 1) * perShare * sh - fee;
+        const row = rowFor(o.marketSlug, o.marketMetadata);
+        row.trades.push({
+          time: o.insertTime, intent: o.intent, longPx: px, effectivePx: perShare,
+          qty: sh, fee, cash: Math.round(cash * 10000) / 10000,
+        });
+        row.cash += cash;
+        row.fees += fee;
+        if (!row.firstTime || (o.insertTime && o.insertTime < row.firstTime)) row.firstTime = o.insertTime;
+      }
+
+      for (const a of acts) {
+        if (a.type !== 'ACTIVITY_TYPE_POSITION_RESOLUTION') continue;
+        const pr = a.positionResolution;
+        if (!pr?.marketSlug || !arbSlugs.has(pr.marketSlug)) continue;
+        const before = pr.beforePosition || {};
+        const after = pr.afterPosition || {};
+        // Settlement pays $1/share when the held side won, else $0. PM.US's
+        // `realized` magnitude is inconsistent across record vintages (pre-fee
+        // vs all-in cost basis, sometimes absent), so only its SIGN is trusted
+        // to infer win/loss — the payout itself comes from position size.
+        const dRealized = num(after.realized) - num(before.realized);
+        const heldQty = Math.abs(Number(before.netPositionDecimal ?? before.netPosition) || 0);
+        const cashReceived = dRealized > 1e-9 ? heldQty : 0;
+        const row = rowFor(pr.marketSlug, before.marketMetadata);
+        row.cash += cashReceived;
+        row.resolved = true;
+        row.resolutionCash = Math.round(cashReceived * 10000) / 10000;
+      }
+
+      // Fee rebates are account-level and can't be attributed per-market —
+      // reported separately, NOT added into strategy P&L.
+      const feeRebates = acts
+        .filter((a) => a.type === 'ACTIVITY_TYPE_TAKER_FEE_REBATE')
+        .reduce((s, a) => s + num(a.accountBalanceChange?.amount), 0);
+
+      // Open positions on arb markets (mark = exchange cashValue). Used only to
+      // mark still-open legs — NOT to decide settled vs open (that's trade/resolution
+      // based below), so a failed positions fetch can't misclassify realized P&L.
+      let positions = {};
+      try { positions = await polyTrader.getPositions(); } catch { /* non-fatal */ }
+      const openPositions = [];
+      for (const [slug, p] of Object.entries(positions)) {
+        if (!arbSlugs.has(slug)) continue;
+        const net = Number(p.netPositionDecimal ?? p.netPosition) || 0;
+        if (net === 0) continue;
+        openPositions.push({
+          slug,
+          title: p.marketMetadata?.title ?? slug,
+          outcome: p.marketMetadata?.outcome ?? null,
+          netPosition: net,
+          costBasis: num(p.cost),
+          mark: num(p.cashValue),
+        });
+      }
+      const marksBySlug = new Map(openPositions.map((p) => [p.slug, p.mark]));
+
+      // Settled vs open is determined purely by whether the bet actually concluded:
+      // a leg is SETTLED only if the market resolved (payout known) or we fully closed
+      // it by trading (net shares ≈ 0). A leg we still hold that hasn't resolved is
+      // IN PLAY — never booked into realized P&L. This keeps Settled P&L to bets that
+      // truly hit, and is independent of the (flaky) positions fetch.
+      const polyRows = [...bySlug.values()]
+        .map((r) => {
+          const netShares = r.trades.reduce(
+            (s, t) => s + (t.intent.startsWith('ORDER_INTENT_BUY') ? t.qty : -t.qty), 0);
+          const stillHolding = Math.abs(netShares) > 1e-6;
+          const open = !r.resolved && stillHolding;
+          return { ...r, cash: Math.round(r.cash * 10000) / 10000, open, mark: open ? (marksBySlug.get(r.slug) ?? null) : null };
+        })
+        .sort((a, b) => (b.firstTime || '').localeCompare(a.firstTime || ''));
+      const polySettledNet = polyRows.filter((r) => !r.open).reduce((s, r) => s + r.cash, 0);
+      const polyOpenCashSoFar = polyRows.filter((r) => r.open).reduce((s, r) => s + r.cash, 0);
+      const polyOpenMark = polyRows.filter((r) => r.open).reduce((s, r) => s + (r.mark || 0), 0);
+
+      let polyBalance = null;
+      try { polyBalance = await polyTrader.getAccountBalance(); } catch { /* non-fatal */ }
+
+      // 3. BFA side
+      // Personal straight bets (not arb-strategy) excluded per user:
+      //   346769641 = Orlando Magic +2 −110 (4/14), 346824787 = Calgary Flames +115 (4/15)
+      const BFA_EXCLUDED_TICKETS = new Set([346769641, 346824787]);
+      // BFA descriptions look like "[953] TOTAL o9½-120 (PIT vrs WSH)\r(pitchers) [Sport:…]".
+      // Keep the pick, drop the rotation number, pitcher line, and sport suffix.
+      const cleanDesc = (s) => {
+        // Some descriptions prefix a venue line ending in "<br>" — keep only the pick.
+        const parts = String(s || '').split(/<br\s*\/?>/i);
+        return parts[parts.length - 1]
+          .replace(/\r[\s\S]*$/, '')
+          .replace(/\s*\[Sport:[^\]]*\]\s*$/, '')
+          .replace(/^\s*\[\d+\]\s*/, '')
+          .trim();
+      };
+      let bfa = { settled: [], open: [], settledNet: 0, openRisk: 0, balance: null, error: null };
+      // Fetch balance / settled / open independently — one failing endpoint must not
+      // blank the others (previously a history 401 also wiped the balance and open bets,
+      // hiding the winning BFA half of every hedged pair and making P&L look like a loss).
+      try {
+        const bal = await getBalance();
+        bfa.balance = Number(bal?.availableBalance ?? null);
+      } catch (e) { bfa.error = e.message; }
+      try {
+        const hist = await getSettledHistory({ startDate: '2026-01-01' });
+        bfa.settled = (hist?.wagers || []).filter((w) => !BFA_EXCLUDED_TICKETS.has(w.id)).map((w) => ({
+          id: w.id, description: cleanDesc(w.description), placedDate: w.placedDate, settledDate: w.settledDate,
+          risk: w.risk, result: w.result, amount: w.amount,
+        }));
+        bfa.settledNet = bfa.settled.reduce((s, w) => s + (Number(w.amount) || 0), 0);
+      } catch (e) { bfa.error = bfa.error || e.message; }
+      try {
+        const open = await getOpenBets();
+        bfa.open = (Array.isArray(open) ? open : []).map((w) => ({
+          id: w.ticketNumber ?? w.idWager,
+          // The real pick lives in betDetails[]; the top-level header is just "STRAIGHT BET".
+          description: (w.betDetails || []).map((d) => cleanDesc(d.detailDescription)).filter(Boolean).join(' + ')
+            || cleanDesc(w.description) || w.headerDescription,
+          placedDate: w.placedDate, risk: w.ifBetRiskAmount ?? w.riskAmount ?? null,
+          toWin: w.winAmount ?? null,
+        }));
+        bfa.openRisk = bfa.open.reduce((s, w) => s + (Number(w.risk) || 0), 0);
+      } catch (e) { bfa.error = bfa.error || e.message; }
+
+      const body = JSON.stringify({
+        generatedAt: new Date().toISOString(),
+        poly: {
+          balance: polyBalance ? { current: polyBalance.currentBalance, buyingPower: polyBalance.buyingPower, marginHeld: polyBalance.marginRequirement } : null,
+          rows: polyRows,
+          openPositions,
+          settledNet: Math.round(polySettledNet * 100) / 100,
+          openCashSoFar: Math.round(polyOpenCashSoFar * 100) / 100,
+          openMark: Math.round(polyOpenMark * 100) / 100,
+          feeRebates: Math.round(feeRebates * 100) / 100,
+        },
+        bfa,
+        combined: {
+          settledNet: Math.round((polySettledNet + bfa.settledNet) * 100) / 100,
+          // Open pairs valued at Poly mark + BFA risk still at stake
+          openPolyMark: Math.round(polyOpenMark * 100) / 100,
+          openBfaRisk: Math.round(bfa.openRisk * 100) / 100,
+        },
+      });
+      pnlCache.body = body;
+      pnlCache.at = now;
+      res.writeHead(200, { 'Content-Type': 'application/json', ...cors });
+      return res.end(body);
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json', ...cors });
+      return res.end(JSON.stringify({ error: e.message }));
+    }
   } else if (req.url?.startsWith('/maker-shadow')) {
     try {
       const u = new URL(req.url, 'http://localhost');
@@ -645,6 +958,7 @@ server.listen(PORT, () => {
   console.log(`Threshold: ${ARB_MIN_COST.toFixed(3)} ≤ cost ≤ ${ARB_MAX_COST.toFixed(3)}`);
   console.log(`Email: ${NOTIFICATION_EMAIL.replace(/(.{3}).*(@.*)/, '$1***$2')}`);
   console.log(`Execution: ${EXECUTION_ENABLED ? 'ENABLED' : 'disabled'} (token ${EXECUTION_TOKEN ? 'set' : 'MISSING'})`);
+  loadDedup();
   console.log('Starting first scan...\n');
   tick();
 });

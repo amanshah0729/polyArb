@@ -89,6 +89,8 @@ async function login(context) {
   await context.clearCookies().catch(() => {});
   await page.goto(SITE, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await page.evaluate(() => { try { sessionStorage.clear(); localStorage.clear(); } catch {} });
+  // The logged-out landing page (no SignalR yet) does settle, so networkidle here is
+  // fine and gives the SPA time to render the Log In button we wait for next.
   await page.reload({ waitUntil: 'networkidle', timeout: 60000 });
 
   const loginBtn = page.locator('button:has-text("Log In"), button:has-text("Login")').first();
@@ -146,7 +148,10 @@ async function getAccessToken({ force = false } = {}) {
   const page = await ctx.newPage();
   const isFresh = (o) => o && o.access_token && o.expires_at && (o.expires_at * 1000) > Date.now() + 30000;
   try {
-    await page.goto(SITE, { waitUntil: 'networkidle', timeout: 60000 });
+    // domcontentloaded, NOT networkidle: BFA's SPA holds connections open (SignalR/polling)
+    // so networkidle never fires and the nav times out. The poll loop below waits for the
+    // SPA's silent sign-in to populate the token instead.
+    await page.goto(SITE, { waitUntil: 'domcontentloaded', timeout: 60000 });
     let oidc = await extractTokenFromPage(page);
     // Wait for SPA to silently refresh if the injected token is stale (refresh_token exchange)
     const deadline = Date.now() + 15000;

@@ -49,7 +49,10 @@ async function resolveMarketSlug(slug) {
   const matcher = require('./marketMatcher');
   const r = await matcher.resolveMarket(client(), { slug });
   const resolved = r?.resolvedSlug || slug;
-  _slugCache.set(slug, resolved);
+  // Only cache real resolutions. Caching the identity fallback would pin the
+  // raw slug (and the old-CLOB book fallback) for the process lifetime even
+  // after the matcher recovers.
+  if (r?.resolvedSlug) _slugCache.set(slug, resolved);
   return resolved;
 }
 
@@ -67,6 +70,7 @@ async function getBBO(marketSlug) {
         bidDepth: md.bidDepth ?? null,
         askDepth: md.askDepth ?? null,
         lastTradePx: num(md.lastTradePx),
+        venue: 'pmus',
       };
     }
   } catch { /* SDK can't find it — fall through to CLOB */ }
@@ -95,6 +99,7 @@ async function getBBO(marketSlug) {
     bidDepth: null,
     askDepth: null,
     lastTradePx: null,
+    venue: 'clob',
   };
 }
 
@@ -104,7 +109,7 @@ async function getDepth(marketSlug) {
     const raw = await client().markets.book(resolved);
     const { bids, offers } = polyBook.normalizeBook(raw);
     if (bids.length || offers.length) {
-      return { marketSlug: resolved, bids, offers, raw };
+      return { marketSlug: resolved, bids, offers, raw, venue: 'pmus' };
     }
   } catch { /* fall through to CLOB */ }
 
@@ -127,7 +132,9 @@ async function getDepth(marketSlug) {
     offers: (clob.asks ?? []).map(toLevel),
   };
   const { bids, offers } = polyBook.normalizeBook(raw);
-  return { marketSlug, bids, offers, raw };
+  // NOTE: this book is the OLD Polymarket CLOB (polymarket.com), not PM.US —
+  // indicative only; orders placed via the polymarket-us SDK cannot hit it.
+  return { marketSlug, bids, offers, raw, venue: 'clob' };
 }
 
 async function placeOrder({ marketSlug, intent, price, quantity, tif = 'TIME_IN_FORCE_IMMEDIATE_OR_CANCEL', orderType = 'ORDER_TYPE_LIMIT' }) {
@@ -281,23 +288,35 @@ async function buyMaker({ marketSlug, intent, price, quantity, timeoutMs = 30000
 }
 
 /**
- * Unwind a long position via limit-sell ladder.
- *  Entry → same price limit (maker) → step down → market.
- *  Bails with alarm if cumulative loss would exceed maxLossPct.
+ * Unwind a position via limit ladder. Entry → same price limit (maker) →
+ * step toward crossing → market. Bails if cumulative loss would exceed maxLossPct.
+ *
+ * All prices are LONG-side coords (SDK convention; entryPrice = fill avgPx).
+ * Closing a LONG posts SELL_LONG (long-side ask): step DOWN toward the bids.
+ * Closing a SHORT posts SELL_SHORT (long-side bid): step UP toward the asks —
+ * the loss cap is a price CEILING, not a floor. Stepping down for a short
+ * close moves away from crossing and never fills.
  */
 async function unwindLadder({ marketSlug, intent: buyIntent, entryPrice, quantity, maxLossPct = 0.06, stepCents = 0.01, stepTimeoutMs = 30000, steps = 3 }) {
   const sellIntent = OPPOSITE_INTENT[buyIntent];
   if (!sellIntent) return { success: false, error: `No opposite intent for ${buyIntent}`, soldQty: 0, realizedValue: 0 };
   const resolved = await resolveMarketSlug(marketSlug);
 
+  const isShortClose = sellIntent === 'ORDER_INTENT_SELL_SHORT';
+  const dir = isShortClose ? +1 : -1;
+  const capPrice = isShortClose
+    ? Math.min(0.99, entryPrice + maxLossPct)
+    : Math.max(0.01, entryPrice - maxLossPct);
+  const clamp = (p) => (isShortClose ? Math.min(capPrice, p) : Math.max(capPrice, p));
+
   let remaining = quantity;
   let realizedValue = 0;
   const attempts = [];
-  const floorPrice = Math.max(0.01, entryPrice - maxLossPct);
 
   for (let i = 0; i < steps && remaining > 0; i++) {
-    const targetPrice = roundTick(Math.max(floorPrice, entryPrice - i * stepCents));
-    if (targetPrice <= floorPrice && i > 0) break;
+    const targetPrice = roundTick(clamp(entryPrice + dir * i * stepCents));
+    const atCap = isShortClose ? targetPrice >= capPrice : targetPrice <= capPrice;
+    if (atCap && i > 0) break;
 
     let order;
     try {
@@ -342,19 +361,19 @@ async function unwindLadder({ marketSlug, intent: buyIntent, entryPrice, quantit
     if (remaining > 0) await cancelOrder(order.orderId, marketSlug);
   }
 
-  // Market-sell residual if we still have shares AND not at loss cap
+  // Market-close residual at the loss cap (most aggressive price we accept)
   if (remaining > 0) {
     try {
       const mkt = await placeOrder({
-        marketSlug, intent: sellIntent, price: floorPrice, quantity: remaining,
+        marketSlug, intent: sellIntent, price: capPrice, quantity: remaining,
         tif: 'TIME_IN_FORCE_IMMEDIATE_OR_CANCEL',
       });
       if (mkt.filledQty > 0) {
         realizedValue += mkt.notional;
         remaining -= mkt.filledQty;
-        attempts.push({ step: 'market', price: floorPrice, filled: mkt.filledQty, avgPx: mkt.avgPx, orderId: mkt.orderId });
+        attempts.push({ step: 'market', price: capPrice, filled: mkt.filledQty, avgPx: mkt.avgPx, orderId: mkt.orderId });
       } else {
-        attempts.push({ step: 'market', price: floorPrice, filled: 0, state: mkt.state });
+        attempts.push({ step: 'market', price: capPrice, filled: 0, state: mkt.state });
       }
     } catch (e) {
       attempts.push({ step: 'market', error: e.message });
@@ -363,7 +382,12 @@ async function unwindLadder({ marketSlug, intent: buyIntent, entryPrice, quantit
 
   const soldQty = quantity - remaining;
   const entryCost = quantity * entryPrice;
-  const unwindLoss = entryCost - realizedValue - (remaining * entryPrice); // residual valued at entry (still held)
+  // Loss on the closed portion (residual valued at entry, i.e. still held):
+  //   long close: sold below entry ⇒ entry − realized
+  //   short close: bought back above entry ⇒ realized − entry
+  const unwindLoss = isShortClose
+    ? realizedValue - soldQty * entryPrice
+    : soldQty * entryPrice - realizedValue;
   return {
     success: remaining === 0,
     soldQty, remainingQty: remaining,
@@ -373,7 +397,31 @@ async function unwindLadder({ marketSlug, intent: buyIntent, entryPrice, quantit
   };
 }
 
-module.exports = { client, resolveMarketSlug, getBBO, getDepth, buyIOC, buyMaker, placeOrder, cancelOrder, unwindLadder, OPPOSITE_INTENT, roundTick };
+// Full PM.US activity history (trades, position resolutions, fee rebates),
+// paginated to exhaustion. Plus current balances and open positions.
+async function listActivities() {
+  const out = [];
+  let cursor = undefined;
+  for (let page = 0; page < 20; page++) {
+    const r = await client().portfolio.activities({ limit: 100, ...(cursor ? { cursor } : {}) });
+    out.push(...(r?.activities || []));
+    if (r?.eof || !r?.nextCursor) break;
+    cursor = r.nextCursor;
+  }
+  return out;
+}
+
+async function getAccountBalance() {
+  const r = await client().account.balances({});
+  return r?.balances?.[0] ?? null;
+}
+
+async function getPositions() {
+  const r = await client().portfolio.positions({});
+  return r?.positions ?? {};
+}
+
+module.exports = { client, resolveMarketSlug, getBBO, getDepth, buyIOC, buyMaker, placeOrder, cancelOrder, unwindLadder, listActivities, getAccountBalance, getPositions, OPPOSITE_INTENT, roundTick };
 
 if (require.main === module) {
   (async () => {
