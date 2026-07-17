@@ -22,7 +22,8 @@ const { runScan } = require('../scripts/bfagaming/scan');
 const eventLog = require('./eventLog');
 const stats = require('./stats');
 const cooldown = require('./bfaCooldown');
-const { executeArb } = require('./arbExecutor');
+const { executeArbGuarded } = require('./arbExecutor');
+const riskLimits = require('./riskLimits');
 const { sizeArb } = require('./betSizing');
 const polyTrader = require('./polyTrader');
 const polyBook = require('./polyBook');
@@ -495,7 +496,7 @@ async function handleExecute(req, res, cors) {
   };
 
   try {
-    const result = await executeArb({
+    const result = await executeArbGuarded({
       bfa, poly,
       // Log the live cost we actually gated/sized on; keep the scanned values for audit.
       meta: {
@@ -527,6 +528,29 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'POST' && req.url === '/execute') {
     return handleExecute(req, res, cors);
+  }
+
+  // Circuit-breaker state — read-only, safe to expose (used by the dashboard
+  // and any monitor to see whether execution is currently HALTED and why).
+  if (req.method === 'GET' && req.url === '/risk') {
+    res.writeHead(200, { 'Content-Type': 'application/json', ...cors });
+    return res.end(JSON.stringify(riskLimits.status()));
+  }
+
+  // Clear a latched HALT. Token-protected (same token as /execute) since it
+  // re-arms live trading. During burn-in you'll hit this after reviewing why
+  // the breaker tripped.
+  if (req.method === 'POST' && req.url === '/risk/clear') {
+    const authHeader = req.headers['authorization'] || '';
+    const provided = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    if (!EXECUTION_TOKEN || provided !== EXECUTION_TOKEN) {
+      res.writeHead(401, { 'Content-Type': 'application/json', ...cors });
+      return res.end(JSON.stringify({ error: 'unauthorized' }));
+    }
+    const before = riskLimits.status().halt;
+    riskLimits.clearHalt();
+    res.writeHead(200, { 'Content-Type': 'application/json', ...cors });
+    return res.end(JSON.stringify({ ok: true, cleared: before }));
   }
 
   if (req.method === 'GET' && req.url?.startsWith('/depth')) {

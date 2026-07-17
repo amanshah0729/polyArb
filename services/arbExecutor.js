@@ -6,6 +6,7 @@ const polyTrader = require('./polyTrader');
 const polyBook = require('./polyBook');
 const { placeBet } = require('../scripts/bfagaming/placeBet');
 const cooldown = require('./bfaCooldown');
+const riskLimits = require('./riskLimits');
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const ALARM_EMAIL = process.env.NOTIFICATION_EMAIL;
@@ -261,6 +262,47 @@ async function executeArb({ bfa, poly, meta = {}, opts = {} }) {
     return final;
   }
 
+  // 3b. Partial fill → scale the BFA hedge to the shares actually filled. The
+  // BFA stake was sized to hedge the FULL poly.quantity (equal-payout); an IOC
+  // that only cleared part of a thin book leaves us net-long BFA if we place
+  // the whole stake. Preserve the original stake:shares ratio. If the scaled
+  // stake would fall below BFA's $5 minimum we can't place a valid hedge at
+  // all, so unwind the Poly fill instead of firing a naked BFA bet.
+  const { BFA_MIN_BET } = require('./betSizing');
+  const requestedQty = poly.quantity;
+  if (Number.isFinite(requestedQty) && requestedQty > 0 && polyBuy.filledQty + 1e-6 < requestedQty) {
+    const fillRatio = polyBuy.filledQty / requestedQty;
+    const scaled = Math.round(bfa.amount * fillRatio * 100) / 100;
+    eventLog.attempt({
+      attemptId, note: 'poly_partial_fill',
+      filledQty: polyBuy.filledQty, requestedQty, fillRatio, bfaFull: bfa.amount, bfaScaled: scaled,
+    });
+    if (scaled < BFA_MIN_BET) {
+      const unwind = await polyTrader.unwindLadder({
+        marketSlug: poly.marketSlug, intent: poly.intent,
+        entryPrice: polyBuy.avgPx ?? (poly.intent === 'ORDER_INTENT_BUY_SHORT' ? 1 - poly.expectedPrice : poly.expectedPrice),
+        quantity: polyBuy.filledQty,
+      });
+      eventLog.unwind({ attemptId, reason: 'partial_fill_below_bfa_min', ...unwind });
+      const final = {
+        attemptId, outcome: unwind.success ? 'poly_unwound' : 'poly_stuck',
+        reason: 'partial_fill_below_bfa_min',
+        polyBuy: { orderId: polyBuy.orderId, filledQty: polyBuy.filledQty, avgPx: polyBuy.avgPx },
+        unwind, unwindLoss: unwind.unwindLoss, ...meta,
+      };
+      eventLog.finalize(final);
+      if (!unwind.success) {
+        await alarm('Poly unwind incomplete after sub-min partial fill',
+          `Failed to sell ${unwind.remainingQty}/${polyBuy.filledQty} shares on ${poly.marketSlug}. Manual intervention required.`,
+          { attemptId, final });
+      }
+      return final;
+    }
+    // Scale the BFA stake and the reported guaranteed PnL to the filled portion.
+    bfa.amount = scaled;
+    if (Number.isFinite(meta.guaranteedPnl)) meta.guaranteedPnl = Math.round(meta.guaranteedPnl * fillRatio * 100) / 100;
+  }
+
   // 4. Place BFA leg
   let bfaRes;
   try {
@@ -330,4 +372,26 @@ async function executeArb({ bfa, poly, meta = {}, opts = {} }) {
   return final;
 }
 
-module.exports = { executeArb };
+/**
+ * Risk-gated wrapper around executeArb. Every execution path (manual /execute
+ * endpoint AND the auto-fire loop) MUST call this, not executeArb directly, so
+ * the circuit breaker is enforced in exactly one place:
+ *   1. precheck the candidate against the fire-time ceilings + sticky HALT
+ *   2. run the arb
+ *   3. record the outcome (may latch a HALT for the next attempt)
+ */
+async function executeArbGuarded({ bfa, poly, meta = {}, opts = {} }) {
+  const gate = riskLimits.precheck({ bfaAmount: bfa?.amount });
+  if (!gate.ok) {
+    const final = eventLog.finalize({
+      attemptId: crypto.randomUUID(), outcome: 'risk_blocked',
+      reason: gate.reason, riskSnapshot: gate.snapshot ?? null, riskLimits: gate.limits ?? null, ...meta,
+    });
+    return final;
+  }
+  const result = await executeArb({ bfa, poly, meta, opts });
+  try { riskLimits.recordOutcome(result); } catch (e) { console.error('riskLimits.recordOutcome threw:', e.message); }
+  return result;
+}
+
+module.exports = { executeArb, executeArbGuarded };

@@ -1,0 +1,13 @@
+# Keep the build context small and never bake secrets/local state into the image.
+node_modules
+priv
+.env
+.env.*
+.git
+next-frontend
+outputs
+mds
+*.har
+**/*.har
+capture-screenshots
+npm-debug.log

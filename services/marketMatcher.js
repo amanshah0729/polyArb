@@ -267,7 +267,7 @@ async function _tier2_listByTag(client, ctx, errs) {
   return best?.slug || null;
 }
 
-async function _tier3_alphaTokens(client, slug, errs) {
+async function _tier3_alphaTokens(client, slug, ctx, errs) {
   // Last-resort slug-substring match (with alpha-strip). For non-team markets
   // (politics, weather) where we have no names. Mirrors the legacy resolver.
   const m = String(slug || '').match(/^([a-z]+)-(.+)-(\d{4}-\d{2}-\d{2})$/i);
@@ -279,12 +279,24 @@ async function _tier3_alphaTokens(client, slug, errs) {
     .map(t => (t || '').toLowerCase().replace(/[^a-z]/g, ''))
     .filter(t => t.length >= 2);
   if (!tokens.length) return null;
+
+  // Market-type prefix guard. This tier does raw substring matching, so without
+  // a guard a moneyline scan row can bind to ANY same-date prop that happens to
+  // contain the two name tokens — e.g. a "win by KO/TKO" prop (`astatc-…`)
+  // instead of the moneyline (`aec-…`). When we know the market type (or that
+  // it's a series), require the candidate to carry the matching prefix; only
+  // the genuinely context-free slug-only callers (politics/weather) skip it.
+  let wantPrefix = null;
+  if (ctx?.isSeries === true) wantPrefix = SERIES_PREFIX;
+  else if (ctx?.isSeries === false && ctx?.marketType) wantPrefix = PREFIX_BY_MARKET_TYPE[ctx.marketType] || null;
+
   try {
     const r = await client.markets.list({ limit: 500, tagIds: [tagId], active: true, closed: false });
     for (const mk of (r?.markets || [])) {
       const s = (mk.slug || '').toLowerCase();
       if (!s.includes(dateStr)) continue;
       if (!tokens.every(tok => s.includes(tok))) continue;
+      if (wantPrefix && !s.startsWith(wantPrefix)) continue;
       return mk.slug;
     }
   } catch (e) { _recordErr(errs, 'tier3', e); }
@@ -354,7 +366,7 @@ async function resolveMarket(client, opts = {}) {
   if (t2) { _setPos(cacheKey, t2); return { resolvedSlug: t2, source: 'name' }; }
 
   // Tier 3 — alpha-stripped token fallback (slug-only callers)
-  const t3 = await _tier3_alphaTokens(client, slug, errs);
+  const t3 = await _tier3_alphaTokens(client, slug, ctx, errs);
   if (t3) { _setPos(cacheKey, t3); return { resolvedSlug: t3, source: 'tokens' }; }
 
   // Only cache the miss if every tier genuinely found nothing. A miss caused
